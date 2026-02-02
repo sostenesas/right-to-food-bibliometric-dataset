@@ -16,3 +16,8 @@ DOI: 10.5281/zenodo.18457557
 ```r
 source("R/scripts/00_setup.R")
 targets::tar_make()
+
+## License
+
+Code: MIT License  
+Data: CC-BY 4.0 (see Zenodo DOI)
