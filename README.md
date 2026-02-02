@@ -2,7 +2,7 @@
 Reproducible bibliometric dataset and pipeline based on OpenAlex.
 
 ## Dataset (Zenodo)
-DOI: 10.5281/zenodo.18457557
+DOI: 10.5281/zenodo.18462393
 
 ## Repository structure
 - `R/scripts/` — data collection and processing scripts
