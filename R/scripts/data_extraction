@@ -1,0 +1,537 @@
+# ==============================================================================
+# COMPLETE DATA EXTRACTION SCRIPT
+# OpenAlex API → Bronze → Silver → Gold layers
+# ==============================================================================
+
+# Load required packages
+library(httr)
+library(jsonlite)
+library(dplyr)
+library(arrow)
+library(purrr)
+library(stringr)
+
+# ==============================================================================
+# PART 1: HELPER FUNCTIONS
+# ==============================================================================
+
+# Build search query for Brazilian right to food research
+build_query_BR <- function() {
+  # Core terms in Portuguese
+  core_terms <- paste(
+    c(
+      'abstract.search.no_stem:"direito à alimentação"',
+      'abstract.search.no_stem:"direito humano à alimentação"',
+      'abstract.search.no_stem:"direito à alimentação adequada"',
+      'abstract.search:"right to food"',
+      'abstract.search:"human right to food"',
+      'abstract.search.no_stem:"segurança alimentar"',
+      'abstract.search.no_stem:"segurança alimentar e nutricional"',
+      'abstract.search.no_stem:"insegurança alimentar"',
+      'abstract.search:"food security"',
+      'abstract.search:"food insecurity"'
+    ),
+    collapse = " OR "
+  )
+  
+  # Add filters
+  paste0(
+    core_terms,
+    ",authorships.institutions.country_code:BR",
+    ",from_publication_date:2014-01-01",
+    ",to_publication_date:2023-12-31",
+    ",language:pt"
+  )
+}
+
+# Safe NULL handler
+safe_null <- function(x, default = NA) {
+  if (is.null(x) || length(x) == 0) default else x
+}
+
+# ==============================================================================
+# PART 2: BRONZE LAYER - RAW API DATA
+# ==============================================================================
+
+fetch_openalex_bronze <- function(filter_string = NULL,
+                                  out_dir = "data/bronze",
+                                  per_page = 200,
+                                  max_pages = NULL,
+                                  select_fields = c(
+                                    "id", "doi", "title", "display_name",
+                                    "publication_year", "publication_date", "type",
+                                    "cited_by_count", "language",
+                                    "primary_location", "open_access",
+                                    "authorships", "concepts", "referenced_works",
+                                    "abstract_inverted_index"
+                                  ),
+                                  polite_email = Sys.getenv("OPENALEX_EMAIL", "")) {
+  
+  # Create output directory
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  # Use default query if not provided
+  if (is.null(filter_string)) {
+    filter_string <- build_query_BR()
+  }
+  
+  # API setup
+  base_url <- "https://api.openalex.org/works"
+  cursor <- "*"
+  page <- 0
+  
+  # Output file
+  stamp <- format(Sys.time(), "%Y-%m-%d_%H%M%S")
+  out_path <- file.path(out_dir, paste0("openalex_bronze_", stamp, ".jsonl"))
+  
+  # Open connection
+  con <- file(out_path, open = "wt", encoding = "UTF-8")
+  on.exit(close(con), add = TRUE)
+  
+  # Prepare select parameter
+  select_param <- paste(select_fields, collapse = ",")
+  
+  cat("Starting data collection from OpenAlex...\n")
+  cat("Filter:", filter_string, "\n")
+  cat("Output:", out_path, "\n\n")
+  
+  # Pagination loop
+  repeat {
+    page <- page + 1
+    if (!is.null(max_pages) && page > max_pages) {
+      cat("\nReached max_pages limit:", max_pages, "\n")
+      break
+    }
+    
+    # Build URL
+    url <- paste0(
+      base_url,
+      "?filter=", URLencode(filter_string, reserved = TRUE),
+      "&select=", URLencode(select_param, reserved = TRUE),
+      "&per-page=", per_page,
+      "&cursor=", URLencode(cursor, reserved = TRUE)
+    )
+    
+    # Headers
+    ua <- httr::user_agent("right-to-food-bibliometrics/1.0")
+    headers <- if (nzchar(polite_email)) {
+      httr::add_headers("mailto" = polite_email)
+    } else {
+      NULL
+    }
+    
+    # Make request
+    cat(sprintf("Page %d... ", page))
+    resp <- httr::GET(url, ua, headers)
+    
+    # Check status
+    if (httr::status_code(resp) != 200) {
+      cat("\nERROR\n")
+      stop(
+        "OpenAlex HTTP ", httr::status_code(resp),
+        "\nURL:\n", url,
+        "\nBody:\n", httr::content(resp, "text", encoding = "UTF-8")
+      )
+    }
+    
+    # Parse response
+    payload <- httr::content(resp, as = "parsed", simplifyVector = FALSE)
+    results <- payload$results
+    
+    if (is.null(results) || length(results) == 0) {
+      cat("No more results.\n")
+      break
+    }
+    
+    cat(sprintf("fetched %d works\n", length(results)))
+    
+    # Write to JSONL
+    for (r in results) {
+      writeLines(
+        jsonlite::toJSON(r, auto_unbox = TRUE, null = "null"),
+        con = con,
+        sep = "\n",
+        useBytes = TRUE
+      )
+    }
+    
+    # Get next cursor
+    next_cursor <- payload$meta$next_cursor
+    if (is.null(next_cursor) || !nzchar(next_cursor)) {
+      cat("\nNo more pages.\n")
+      break
+    }
+    cursor <- next_cursor
+    
+    # Rate limiting
+    Sys.sleep(0.2)
+  }
+  
+  cat("\n✓ Data collection complete!\n")
+  cat("Total pages fetched:", page, "\n")
+  cat("Output file:", out_path, "\n")
+  
+  return(out_path)
+}
+
+# ==============================================================================
+# PART 3: SILVER LAYER - NORMALIZED TABLES
+# ==============================================================================
+
+build_silver_tables <- function(bronze_path, out_dir = "data/silver") {
+  
+  if (!file.exists(bronze_path)) {
+    stop("Bronze file not found: ", bronze_path)
+  }
+  
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  cat("\nBuilding silver layer from:", bronze_path, "\n")
+  
+  # Read JSONL
+  cat("Reading JSONL...\n")
+  lines <- readLines(bronze_path, warn = FALSE, encoding = "UTF-8")
+  cat("Total lines:", length(lines), "\n")
+  
+  # Parse JSON
+  cat("Parsing JSON...\n")
+  recs <- lapply(lines, function(x) {
+    jsonlite::fromJSON(x, simplifyVector = FALSE)
+  })
+  cat("Total records:", length(recs), "\n\n")
+  
+  # -------------------------------------------
+  # TABLE 1: works
+  # -------------------------------------------
+  cat("Building works table...\n")
+  
+  works <- dplyr::tibble(
+    work_id = vapply(recs, function(r) safe_null(r$id, NA_character_), character(1)),
+    doi = vapply(recs, function(r) safe_null(r$doi, NA_character_), character(1)),
+    title = vapply(recs, function(r) safe_null(r$title, NA_character_), character(1)),
+    display_name = vapply(recs, function(r) safe_null(r$display_name, NA_character_), character(1)),
+    publication_year = vapply(recs, function(r) safe_null(r$publication_year, NA_integer_), integer(1)),
+    publication_date = vapply(recs, function(r) safe_null(r$publication_date, NA_character_), character(1)),
+    type = vapply(recs, function(r) safe_null(r$type, NA_character_), character(1)),
+    cited_by_count = vapply(recs, function(r) safe_null(r$cited_by_count, NA_integer_), integer(1)),
+    language = vapply(recs, function(r) safe_null(r$language, NA_character_), character(1)),
+    source_id = vapply(recs, function(r) safe_null(r$primary_location$source$id, NA_character_), character(1)),
+    source_name = vapply(recs, function(r) safe_null(r$primary_location$source$display_name, NA_character_), character(1)),
+    open_access_status = vapply(recs, function(r) safe_null(r$open_access$oa_status, NA_character_), character(1)),
+    open_access_is_oa = vapply(recs, function(r) safe_null(r$open_access$is_oa, NA), logical(1))
+  )
+  
+  cat("  Works:", nrow(works), "\n")
+  
+  # -------------------------------------------
+  # TABLE 2: authorships
+  # -------------------------------------------
+  cat("Building authorships table...\n")
+  
+  authorships <- purrr::map_dfr(recs, function(r) {
+    auths <- r$authorships
+    if (is.null(auths) || length(auths) == 0) return(NULL)
+    
+    purrr::map_dfr(auths, function(a) {
+      dplyr::tibble(
+        work_id = safe_null(r$id, NA_character_),
+        author_id = safe_null(a$author$id, NA_character_),
+        author_name = safe_null(a$author$display_name, NA_character_),
+        author_position = safe_null(a$author_position, NA_character_),
+        is_corresponding = safe_null(a$is_corresponding, NA)
+      )
+    })
+  })
+  
+  if (is.null(authorships) || nrow(authorships) == 0) {
+    authorships <- dplyr::tibble(
+      work_id = character(),
+      author_id = character(),
+      author_name = character(),
+      author_position = character(),
+      is_corresponding = logical()
+    )
+  }
+  
+  cat("  Authorships:", nrow(authorships), "\n")
+  
+  # -------------------------------------------
+  # TABLE 3: concepts
+  # -------------------------------------------
+  cat("Building concepts table...\n")
+  
+  concepts <- purrr::map_dfr(recs, function(r) {
+    cs <- r$concepts
+    if (is.null(cs) || length(cs) == 0) return(NULL)
+    
+    purrr::map_dfr(cs, function(cn) {
+      dplyr::tibble(
+        work_id = safe_null(r$id, NA_character_),
+        concept_id = safe_null(cn$id, NA_character_),
+        concept_name = safe_null(cn$display_name, NA_character_),
+        concept_level = safe_null(cn$level, NA_integer_),
+        concept_score = safe_null(cn$score, NA_real_)
+      )
+    })
+  })
+  
+  if (is.null(concepts) || nrow(concepts) == 0) {
+    concepts <- dplyr::tibble(
+      work_id = character(),
+      concept_id = character(),
+      concept_name = character(),
+      concept_level = integer(),
+      concept_score = numeric()
+    )
+  }
+  
+  cat("  Concepts:", nrow(concepts), "\n")
+  
+  # -------------------------------------------
+  # TABLE 4: references
+  # -------------------------------------------
+  cat("Building references table...\n")
+  
+  references <- purrr::map_dfr(recs, function(r) {
+    refs <- r$referenced_works
+    if (is.null(refs) || length(refs) == 0) return(NULL)
+    
+    dplyr::tibble(
+      work_id = safe_null(r$id, NA_character_),
+      referenced_work_id = unlist(refs, use.names = FALSE)
+    )
+  })
+  
+  if (is.null(references) || nrow(references) == 0) {
+    references <- dplyr::tibble(
+      work_id = character(),
+      referenced_work_id = character()
+    )
+  }
+  
+  cat("  References:", nrow(references), "\n\n")
+  
+  # -------------------------------------------
+  # SAVE TABLES
+  # -------------------------------------------
+  cat("Saving Parquet files...\n")
+  
+  arrow::write_parquet(works, file.path(out_dir, "works.parquet"))
+  arrow::write_parquet(authorships, file.path(out_dir, "authorships.parquet"))
+  arrow::write_parquet(concepts, file.path(out_dir, "concepts.parquet"))
+  arrow::write_parquet(references, file.path(out_dir, "references.parquet"))
+  
+  cat("✓ Silver layer complete!\n\n")
+  
+  # Also save as CSV
+  cat("Saving CSV files...\n")
+  write.csv(works, file.path(out_dir, "works.csv"), row.names = FALSE)
+  write.csv(authorships, file.path(out_dir, "authorships.csv"), row.names = FALSE)
+  write.csv(concepts, file.path(out_dir, "concepts.csv"), row.names = FALSE)
+  write.csv(references, file.path(out_dir, "references.csv"), row.names = FALSE)
+  
+  cat("✓ CSV files saved!\n\n")
+  
+  return(list(
+    works = file.path(out_dir, "works.parquet"),
+    authorships = file.path(out_dir, "authorships.parquet"),
+    concepts = file.path(out_dir, "concepts.parquet"),
+    references = file.path(out_dir, "references.parquet")
+  ))
+}
+
+# ==============================================================================
+# PART 4: GOLD LAYER - ANALYTICAL TABLES
+# ==============================================================================
+
+build_gold_tables <- function(silver_dir = "data/silver",
+                              out_dir = "data/gold") {
+  
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  cat("\nBuilding gold layer...\n")
+  
+  # Load silver tables
+  works <- arrow::read_parquet(file.path(silver_dir, "works.parquet"))
+  concepts <- arrow::read_parquet(file.path(silver_dir, "concepts.parquet"))
+  
+  # -------------------------------------------
+  # TABLE 1: production_by_year
+  # -------------------------------------------
+  cat("Building production_by_year...\n")
+  
+  prod_year <- works %>%
+    dplyr::filter(!is.na(publication_year)) %>%
+    dplyr::count(publication_year, name = "n")
+  
+  arrow::write_parquet(prod_year, file.path(out_dir, "production_by_year.parquet"))
+  
+  # -------------------------------------------
+  # TABLE 2: production_by_type
+  # -------------------------------------------
+  cat("Building production_by_type...\n")
+  
+  prod_type <- works %>%
+    dplyr::count(type, name = "n") %>%
+    dplyr::arrange(dplyr::desc(n))
+  
+  arrow::write_parquet(prod_type, file.path(out_dir, "production_by_type.parquet"))
+  
+  # -------------------------------------------
+  # TABLE 3: top_sources
+  # -------------------------------------------
+  cat("Building top_sources...\n")
+  
+  top_sources <- works %>%
+    dplyr::filter(!is.na(source_name)) %>%
+    dplyr::count(source_name, sort = TRUE, name = "n") %>%
+    dplyr::slice_head(n = 20)
+  
+  arrow::write_parquet(top_sources, file.path(out_dir, "top_sources.parquet"))
+  
+  # -------------------------------------------
+  # TABLE 4: top_concepts
+  # -------------------------------------------
+  cat("Building top_concepts...\n")
+  
+  top_concepts <- concepts %>%
+    dplyr::filter(!is.na(concept_name)) %>%
+    dplyr::filter(!is.na(concept_level)) %>%
+    dplyr::filter(concept_level >= 1, concept_level <= 3) %>%
+    dplyr::filter(!is.na(concept_score), concept_score >= 0.2) %>%
+    dplyr::count(concept_id, concept_name, concept_level, sort = TRUE, name = "n_works") %>%
+    dplyr::slice_head(n = 200)
+  
+  arrow::write_parquet(top_concepts, file.path(out_dir, "top_concepts.parquet"))
+  
+  # -------------------------------------------
+  # TABLE 5: concept_cooccurrence_edges
+  # -------------------------------------------
+  cat("Building concept_cooccurrence_edges...\n")
+  
+  # Filter to top concepts
+  concepts_f <- concepts %>%
+    dplyr::distinct(work_id, concept_id, concept_name) %>%
+    dplyr::semi_join(dplyr::distinct(top_concepts, concept_id), by = "concept_id")
+  
+  # Create co-occurrence edges
+  pairs <- concepts_f %>%
+    dplyr::inner_join(concepts_f, by = "work_id", suffix = c("_a", "_b")) %>%
+    dplyr::filter(concept_id_a < concept_id_b) %>%
+    dplyr::count(concept_id_a, concept_name_a, concept_id_b, concept_name_b, name = "weight") %>%
+    dplyr::filter(weight >= 5) %>%
+    dplyr::arrange(dplyr::desc(weight))
+  
+  arrow::write_parquet(pairs, file.path(out_dir, "concept_cooccurrence_edges.parquet"))
+  
+  cat("✓ Gold layer complete!\n\n")
+  
+  return(list(
+    production_by_year = file.path(out_dir, "production_by_year.parquet"),
+    production_by_type = file.path(out_dir, "production_by_type.parquet"),
+    top_sources = file.path(out_dir, "top_sources.parquet"),
+    top_concepts = file.path(out_dir, "top_concepts.parquet"),
+    concept_cooccurrence_edges = file.path(out_dir, "concept_cooccurrence_edges.parquet")
+  ))
+}
+
+# ==============================================================================
+# PART 5: MASTER FUNCTION - COMPLETE PIPELINE
+# ==============================================================================
+
+run_complete_extraction <- function(max_pages = NULL,
+                                   polite_email = "",
+                                   bronze_dir = "data/bronze",
+                                   silver_dir = "data/silver",
+                                   gold_dir = "data/gold") {
+  
+  cat("\n")
+  cat("================================================================================\n")
+  cat("COMPLETE DATA EXTRACTION PIPELINE\n")
+  cat("OpenAlex API → Bronze → Silver → Gold\n")
+  cat("================================================================================\n\n")
+  
+  start_time <- Sys.time()
+  
+  # STEP 1: Fetch data from OpenAlex (Bronze)
+  cat("\n--- STEP 1: BRONZE LAYER (OpenAlex API) ---\n")
+  bronze_path <- fetch_openalex_bronze(
+    filter_string = build_query_BR(),
+    out_dir = bronze_dir,
+    max_pages = max_pages,
+    polite_email = polite_email
+  )
+  
+  # STEP 2: Build normalized tables (Silver)
+  cat("\n--- STEP 2: SILVER LAYER (Normalized Tables) ---\n")
+  silver_paths <- build_silver_tables(bronze_path, out_dir = silver_dir)
+  
+  # STEP 3: Build analytical tables (Gold)
+  cat("\n--- STEP 3: GOLD LAYER (Analytical Tables) ---\n")
+  gold_paths <- build_gold_tables(silver_dir = silver_dir, out_dir = gold_dir)
+  
+  # Summary
+  end_time <- Sys.time()
+  elapsed <- difftime(end_time, start_time, units = "mins")
+  
+  cat("\n")
+  cat("================================================================================\n")
+  cat("✓ PIPELINE COMPLETE!\n")
+  cat("================================================================================\n")
+  cat("Elapsed time:", round(elapsed, 2), "minutes\n\n")
+  
+  cat("Bronze layer:\n")
+  cat("  ", bronze_path, "\n\n")
+  
+  cat("Silver layer:\n")
+  for (name in names(silver_paths)) {
+    cat("  ", name, ":", silver_paths[[name]], "\n")
+  }
+  cat("\n")
+  
+  cat("Gold layer:\n")
+  for (name in names(gold_paths)) {
+    cat("  ", name, ":", gold_paths[[name]], "\n")
+  }
+  cat("\n")
+  
+  return(list(
+    bronze = bronze_path,
+    silver = silver_paths,
+    gold = gold_paths,
+    elapsed_time = elapsed
+  ))
+}
+
+# ==============================================================================
+# USAGE EXAMPLES
+# ==============================================================================
+
+# Example 1: Test run (small sample)
+# results <- run_complete_extraction(max_pages = 2)
+
+# Example 2: Full extraction
+# results <- run_complete_extraction(
+#   max_pages = NULL,  # No limit
+#   polite_email = "your.email@example.com"
+# )
+
+# Example 3: Just bronze layer
+# bronze_path <- fetch_openalex_bronze(
+#   filter_string = build_query_BR(),
+#   max_pages = 5
+# )
+
+# Example 4: Build silver from existing bronze
+# silver_paths <- build_silver_tables("data/bronze/openalex_bronze_2025-02-02.jsonl")
+
+# Example 5: Build gold from existing silver
+# gold_paths <- build_gold_tables()
+
+# ==============================================================================
+# QUICK START
+# ==============================================================================
+
+# To run the complete pipeline, simply execute:
+# source("complete_extraction.R")
+# results <- run_complete_extraction()
