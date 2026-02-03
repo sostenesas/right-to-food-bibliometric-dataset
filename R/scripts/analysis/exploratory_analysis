@@ -83,7 +83,7 @@ if (file.exists(silver_works)) {
   
 } else {
   stop("❌ Nenhuma fonte de dados encontrada!\n",
-       "Coloque seu arquivo Excel em: data/raw/plan_art_dt_alim_nova.xlsx\n",
+       "Coloque seu arquivo Excel em: data/raw/plan_art_dt_alim.xlsx\n",
        "Ou execute o pipeline de extração primeiro: source('R/complete_extraction.R')")
 }
 
