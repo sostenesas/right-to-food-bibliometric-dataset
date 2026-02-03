@@ -1,0 +1,7 @@
+{
+  "name": "R",
+  "image": "rocker/r-ver:latest",
+  "extensions": [
+    "REditorSupport.r"
+  ]
+}
