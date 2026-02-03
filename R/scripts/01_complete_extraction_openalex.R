@@ -4,7 +4,7 @@
 # (Includes API key auth via env var OPENALEX_API_KEY)
 # ==============================================================================
 
-source("scripts/00_setup_openalex.R")
+source("scripts/00_setup.R")
 
 # ==============================================================================
 # PART 1: HELPER FUNCTIONS
