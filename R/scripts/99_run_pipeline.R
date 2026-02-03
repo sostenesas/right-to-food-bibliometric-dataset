@@ -3,7 +3,7 @@
 # Simple entry point to run everything
 # ==============================================================================
 
-source("scripts/01_complete_extraction_openalex.R")
+source("R/scripts/01_complete_extraction_openalex.R")
 
 # Test run:
 # results <- run_complete_extraction(max_pages = 2)
