@@ -1,0 +1,3 @@
+# Copy this file to .Renviron (do not commit .Renviron)
+OPENALEX_API_KEY=YOUR_KEY_HERE
+OPENALEX_EMAIL=your.email@example.com
