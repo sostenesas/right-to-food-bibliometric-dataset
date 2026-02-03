@@ -3,4 +3,5 @@ outputs/
 *.Rhistory
 *.RData
 .Rproj.user/
+.Renviron
 renv/library/
