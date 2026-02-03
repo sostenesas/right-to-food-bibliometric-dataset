@@ -1,7 +1,30 @@
 {
-  "name": "R",
-  "image": "rocker/r-ver:latest",
-  "extensions": [
-    "REditorSupport.r"
-  ]
+  "name": "R OpenAlex Research",
+  "image": "rocker/rstudio:latest",
+
+  "features": {
+    "ghcr.io/devcontainers/features/git:1": {},
+    "ghcr.io/devcontainers/features/common-utils:2": {},
+    "ghcr.io/devcontainers/features/python:1": {}
+  },
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "REditorSupport.r",
+        "quarto.quarto",
+        "ms-toolsai.jupyter",
+        "github.copilot",
+        "GitHub.vscode-pull-request-github",
+        "redhat.vscode-yaml"
+      ],
+      "settings": {
+        "r.rterm.linux": "/usr/bin/R",
+        "r.alwaysUseActiveTerminal": true,
+        "editor.formatOnSave": true
+      }
+    }
+  },
+
+  "postCreateCommand": "apt-get update && apt-get install -y libcurl4-openssl-dev libssl-dev libxml2-dev pandoc texlive-latex-base texlive-fonts-recommended texlive-fonts-extra texlive-latex-extra jq && R -e \"install.packages(c('tidyverse','httr','jsonlite','arrow','purrr','stringr','openalexR','targets','renv','knitr','rmarkdown'), repos='https://cloud.r-project.org')\""
 }
