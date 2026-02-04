@@ -66,7 +66,7 @@ if (file.exists(silver_works)) {
     df_rev_alim <- df_works %>%
       rename(
         id = work_id,
-        abstract = display_name  # Ajustar conforme estrutura real
+        title = title  # Ajustar conforme estrutura real
       )
   } else {
     df_rev_alim <- df_works
