@@ -1,513 +1,361 @@
 # ==============================================================================
-# 01_complete_extraction_openalex.R
+# SCRIPT: Análise Exploratória Bibliométrica (robust + HTML wordcloud)
+# Arquivo: R/analysis/exploratory_analysis.R
+# Descrição: Análise bibliométrica com visualizações e análise de texto
 # OpenAlex API → Bronze (JSONL raw) → Silver (Parquet/CSV) → Gold (aggregations)
 # Exposes: run_complete_extraction()
 # ==============================================================================
 
 suppressPackageStartupMessages({
-  library(httr)
-  library(jsonlite)
-  library(dplyr)
-  library(tidyr)
-  library(purrr)
-  library(stringr)
+  library(tidyverse)
   library(arrow)
-  library(readr)
-  library(lubridate)
+  library(stringi)      # for accent removal (Latin-ASCII)
+  library(tm)
+  library(htmlwidgets)
 })
 
-`%||%` <- function(x, y) if (is.null(x)) y else x
+# Optional packages: we try to load/install if missing
+ensure_pkg <- function(pkg) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg, repos = "https://cloud.r-project.org")
+  }
+}
+
+ensure_pkg("wordcloud2")  # HTML wordcloud
+# htmlwidgets is already loaded above, but keep safe
+ensure_pkg("htmlwidgets")
 
 # ----------------------------
 # Helpers
 # ----------------------------
 cat_line <- function(...) cat(..., "\n", sep = "")
 ensure_dir <- function(path) if (!dir.exists(path)) dir.create(path, recursive = TRUE, showWarnings = FALSE)
-timestamp_now <- function() format(Sys.time(), "%Y-%m-%d_%H%M%S")
 
-# Parse a JSONL line into an R list (never simplify to vectors)
-safe_fromJSON <- function(x) {
-  tryCatch(jsonlite::fromJSON(x, simplifyVector = FALSE), error = function(e) NULL)
+# Normalize text for robust matching (lower + remove accents + squish)
+norm_txt <- function(x) {
+  x <- ifelse(is.na(x), "", x)
+  x <- tolower(x)
+  x <- stringi::stri_trans_general(x, "Latin-ASCII")
+  x <- stringr::str_squish(x)
+  x
 }
 
-# Coerce anything to a single character scalar (never return json/list objects)
-to_chr <- function(x) {
-  if (is.null(x)) return(NA_character_)
-  if (is.character(x)) return(x[[1]])
-  if (inherits(x, "json")) return(as.character(x))
-  if (is.list(x)) return(as.character(jsonlite::toJSON(x, auto_unbox = TRUE, null = "null")))
-  out <- suppressWarnings(as.character(x))
-  if (length(out) == 0) NA_character_ else out[[1]]
+# Robust "contains any keyword" (fixed match, no regex surprises)
+contains_any <- function(txt, keys_norm) {
+  if (is.na(txt) || !nzchar(txt)) return(FALSE)
+  any(stringr::str_detect(txt, stringr::fixed(keys_norm)))
 }
 
-# IMPORTANT: write JSONL as raw JSON strings (one object per line)
-# We force result to be a plain character line.
-append_jsonl <- function(path, obj) {
-  line <- as.character(jsonlite::toJSON(obj, auto_unbox = TRUE, null = "null", digits = NA))
-  write(line, file = path, append = TRUE)
+# Try to detect project root
+detect_project_root <- function() {
+  # If running under RStudio
+  if (requireNamespace("rstudioapi", quietly = TRUE) && rstudioapi::isAvailable()) {
+    p <- rstudioapi::getActiveDocumentContext()$path
+    if (!is.null(p) && nzchar(p)) return(dirname(dirname(p)))
+  }
+  # fallback: current wd
+  getwd()
 }
 
-# Normalize abstract into plain text (character)
-normalize_abstract_text <- function(r) {
-  # 1) Direct 'abstract' field (if present)
-  a <- r$abstract %||% NULL
-  if (!is.null(a)) return(to_chr(a))
+# ==============================================================================
+# 0) Setup
+# ==============================================================================
+cat_line("=== ANÁLISE EXPLORATÓRIA BIBLIOMÉTRICA (ROBUST) ===\n")
 
-  # 2) OpenAlex typical: abstract_inverted_index
-  ai <- r$abstract_inverted_index %||% NULL
-  if (is.null(ai)) return(NA_character_)
-  if (!is.list(ai)) return(to_chr(ai))
+project_root <- detect_project_root()
+setwd(project_root)
 
-  # Reconstruct text from inverted index (word -> positions)
-  tryCatch({
-    max_pos <- max(unlist(ai, use.names = FALSE)) + 1L
-    out <- rep("", max_pos)
+cat_line("Diretório do projeto: ", getwd(), "\n")
 
-    for (w in names(ai)) {
-      pos <- ai[[w]]
-      if (length(pos) > 0) out[pos + 1L] <- w
-    }
+ensure_dir("outputs/figures")
+ensure_dir("outputs/tables")
+ensure_dir("outputs/reports")
 
-    txt <- stringr::str_squish(paste(out, collapse = " "))
-    if (nchar(txt) == 0) NA_character_ else txt
-  }, error = function(e) {
-    to_chr(ai)
-  })
+# ==============================================================================
+# 1) Load data
+# ==============================================================================
+cat_line("--- PARTE 1: Carregamento de Dados ---")
+
+silver_works <- "data/silver/works.parquet"
+silver_authorships <- "data/silver/authorships.parquet"
+silver_concepts <- "data/silver/concepts.parquet"
+silver_references <- "data/silver/references.parquet"
+
+if (!file.exists(silver_works)) {
+  stop("❌ Não encontrei: ", silver_works, "\nRode primeiro o pipeline de extração.")
 }
 
-# ----------------------------
-# Configuration
-# ----------------------------
-BASE_URL <- "https://api.openalex.org/works"
+cat_line("✓ Carregando dados da camada Silver (Parquet)...")
+works <- read_parquet(silver_works)
 
-DIR_BRONZE <- "data/bronze"
-DIR_SILVER <- "data/silver"
-DIR_GOLD   <- "data/gold"
+# Load optional tables if present
+authorships <- if (file.exists(silver_authorships)) read_parquet(silver_authorships) else NULL
+concepts <- if (file.exists(silver_concepts)) read_parquet(silver_concepts) else NULL
+references <- if (file.exists(silver_references)) read_parquet(silver_references) else NULL
 
-ensure_dir(DIR_BRONZE)
-ensure_dir(DIR_SILVER)
-ensure_dir(DIR_GOLD)
+cat_line("✓ Dados carregados: ", nrow(works), " documentos\n")
 
-OPENALEX_API_KEY <- Sys.getenv("OPENALEX_API_KEY", unset = "")
+# ==============================================================================
+# 1.1) Schema compatibility / safety
+# ==============================================================================
+# Make sure essential columns exist
+if (!"id" %in% names(works) && "work_id" %in% names(works)) {
+  works <- works %>% rename(id = work_id)
+}
+if (!"work_id" %in% names(works) && "id" %in% names(works)) {
+  works <- works %>% rename(work_id = id)
+}
 
-# ----------------------------
-# Query builder
-# - text terms go in search=
-# - structured filters go in filter=
-# ----------------------------
-build_openalex_query <- function(use_language_filter = TRUE) {
+# Ensure title/display_name exist (for older scripts / compatibility)
+if (!"title" %in% names(works)) works$title <- NA_character_
+if (!"display_name" %in% names(works)) works$display_name <- NA_character_
 
-  search_terms <- c(
-    '"direito à alimentação"',
-    '"direito humano à alimentação"',
-    '"direito à alimentação adequada"',
-    '"segurança alimentar"',
-    '"segurança alimentar e nutricional"',
-    '"insegurança alimentar"',
-    '"right to food"',
-    '"human right to food"',
-    '"food security"',
-    '"food insecurity"'
+# If one exists, backfill the other
+works <- works %>%
+  mutate(
+    title = ifelse(is.na(title) | !nzchar(title), display_name, title),
+    display_name = ifelse(is.na(display_name) | !nzchar(display_name), title, display_name)
   )
 
-  search_query <- paste0("(", paste(search_terms, collapse = " OR "), ")")
+# Ensure abstract exists
+if (!"abstract" %in% names(works)) works$abstract <- NA_character_
 
-  filter_parts <- c(
-    "authorships.institutions.country_code:BR",
-    "from_publication_date:2014-01-01",
-    "to_publication_date:2023-12-31"
+# Ensure year/citations exist
+if (!"publication_year" %in% names(works)) works$publication_year <- NA_integer_
+if (!"cited_by_count" %in% names(works)) works$cited_by_count <- NA_real_
+
+# Coerce types safely
+works <- works %>%
+  mutate(
+    publication_year = suppressWarnings(as.integer(publication_year)),
+    cited_by_count = suppressWarnings(as.numeric(cited_by_count))
   )
 
-  if (isTRUE(use_language_filter)) {
-    filter_parts <- c(filter_parts, "language:pt")
-  }
+# ==============================================================================
+# 2) Robust thematic filtering
+# ==============================================================================
+cat_line("--- PARTE 2: Filtragem Temática (robusta) ---")
 
-  filter_query <- paste(filter_parts, collapse = ",")
+# Keywords: keep in PT + EN, but match will happen on normalized (no accents)
+keywords <- c(
+  "direito à alimentação",
+  "direito humano à alimentação",
+  "direito à alimentação adequada",
+  "segurança alimentar",
+  "segurança alimentar e nutricional",
+  "insegurança alimentar",
+  "soberania alimentar",
+  "right to food",
+  "human right to food",
+  "food security",
+  "food insecurity"
+)
 
-  list(search = search_query, filter = filter_query)
+keywords_norm <- norm_txt(keywords)
+
+# Build combined searchable text
+works <- works %>%
+  mutate(
+    .text_raw = paste(
+      coalesce(title, ""),
+      coalesce(display_name, ""),
+      coalesce(abstract, ""),
+      sep = " "
+    ),
+    .text_norm = norm_txt(.text_raw)
+  )
+
+filtered <- works %>%
+  filter(purrr::map_lgl(.text_norm, contains_any, keys_norm = keywords_norm))
+
+cat_line("✓ Documentos após filtragem: ", nrow(filtered))
+cat_line("  Taxa de retenção: ", round(nrow(filtered) / nrow(works) * 100, 1), "%\n")
+
+# If filter returns zero, do diagnostics and continue with full dataset
+if (nrow(filtered) == 0) {
+  cat_line("⚠ Nenhum documento após filtragem. Vou gerar diagnóstico e seguir sem filtro.\n")
+
+  # show examples of normalized text to help user adjust keywords
+  examples <- works %>%
+    filter(!is.na(.text_norm) & nzchar(.text_norm)) %>%
+    slice_head(n = 8) %>%
+    transmute(example = substr(.text_norm, 1, 220))
+
+  readr::write_csv(examples, "outputs/reports/filter_diagnostic_examples.csv")
+  cat_line("✓ Exemplos salvos em outputs/reports/filter_diagnostic_examples.csv")
+
+  # Also compute candidate terms (top 50) from titles/abstracts
+  text_diag <- works %>%
+    transmute(txt = norm_txt(paste(coalesce(title, ""), coalesce(abstract, "")))) %>%
+    filter(nzchar(txt)) %>%
+    pull(txt)
+
+  # Keep it light: just tokenise with stringr (no tidytext dependency)
+  tokens <- unlist(strsplit(text_diag, "\\s+"))
+  tokens <- tokens[nchar(tokens) >= 4]
+  # remove very common stopwords (already normalized, so use ASCII)
+  stop_basic <- c("para","pela","pelo","sobre","entre","como","mais","menos","aqui",
+                  "da","de","do","das","dos","uma","um","uns","umas","que","com","sem",
+                  "nos","nas","na","no","em","por","ao","aos","as","os","e","ou","se",
+                  "sua","seu","suas","seus","tambem","sao","ser","foi","tem","tendo",
+                  "direito","alimentacao") # you can remove this if you want to keep
+  tokens <- tokens[!tokens %in% stop_basic]
+  top_tokens <- sort(table(tokens), decreasing = TRUE)
+  df_top_tokens <- tibble(
+    token = names(top_tokens)[1:min(80, length(top_tokens))],
+    freq = as.integer(top_tokens[1:min(80, length(top_tokens))])
+  )
+  readr::write_csv(df_top_tokens, "outputs/reports/filter_diagnostic_top_tokens.csv")
+  cat_line("✓ Top tokens salvos em outputs/reports/filter_diagnostic_top_tokens.csv\n")
+
+  # Continue with full dataset
+  filtered <- works
+  cat_line("✓ Prosseguindo com a base completa (sem filtro) para gerar outputs.\n")
 }
 
-# ----------------------------
-# STEP 1: Bronze (collect JSONL raw)
-# ----------------------------
-collect_openalex_bronze <- function(out_jsonl,
-                                   search_query,
-                                   filter_query,
-                                   polite_email = "",
-                                   per_page = 200,
-                                   delay_sec = 0.2,
-                                   max_pages = Inf) {
+# Save filtered set (for traceability)
+readr::write_csv(
+  filtered %>% select(work_id, doi, title, display_name, publication_year, cited_by_count, type, language, source),
+  "outputs/tables/works_filtered_minimal.csv"
+)
 
-  headers <- add_headers("User-Agent" = "right-to-food-bibliometric-dataset (R script)")
-  if (nzchar(OPENALEX_API_KEY)) {
-    headers <- add_headers(
-      "User-Agent" = "right-to-food-bibliometric-dataset (R script)",
-      "Authorization" = paste("Bearer", OPENALEX_API_KEY)
-    )
-  }
+# Narrative review candidates (>=10 citations)
+narrative <- filtered %>%
+  filter(!is.na(cited_by_count) & cited_by_count >= 10) %>%
+  arrange(desc(cited_by_count))
 
-  if (file.exists(out_jsonl)) file.remove(out_jsonl)
+readr::write_csv(
+  narrative %>% select(work_id, doi, title, publication_year, cited_by_count, source),
+  "outputs/tables/narrative_candidates_citations_ge10.csv"
+)
 
-  cursor <- "*"
-  page <- 0
-  total_records <- 0
+cat_line("✓ Documentos para revisão narrativa (≥10 citações): ", nrow(narrative), "\n")
 
-  cat_line("\n--- STEP 1: BRONZE LAYER (OpenAlex API → JSONL) ---")
-  cat_line("Starting data collection from OpenAlex...")
-  cat_line("Search: ", search_query)
-  cat_line("Filter: ", filter_query)
-  cat_line("Output: ", out_jsonl, "\n")
+# ==============================================================================
+# 3) Visualizations
+# ==============================================================================
+cat_line("--- PARTE 3: Visualizações ---")
 
-  repeat {
-    page <- page + 1
-    if (page > max_pages) {
-      cat_line("Reached max_pages limit: ", max_pages)
-      break
-    }
+# 3.1 Production by year
+df_year <- filtered %>%
+  filter(!is.na(publication_year)) %>%
+  count(publication_year, name = "n") %>%
+  arrange(publication_year)
 
-    q <- list(
-      search = search_query,
-      filter = filter_query,
-      cursor = cursor,
-      `per-page` = per_page
-    )
-    if (nzchar(polite_email)) q$mailto <- polite_email
+p_year_bar <- ggplot(df_year, aes(publication_year, n)) +
+  geom_col() +
+  theme_minimal() +
+  labs(
+    title = "Produção por ano",
+    x = "Ano",
+    y = "Número de documentos"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
 
-    res <- GET(BASE_URL, headers, query = q)
+ggsave("outputs/figures/production_by_year_bar.png", p_year_bar, width = 8, height = 5, dpi = 150)
 
-    if (status_code(res) != 200) {
-      txt <- content(res, as = "text", encoding = "UTF-8")
-      stop("OpenAlex request failed (HTTP ", status_code(res), "): ", txt)
-    }
+p_year_line <- ggplot(df_year, aes(publication_year, n)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  theme_minimal() +
+  labs(
+    title = "Evolução temporal da produção",
+    x = "Ano",
+    y = "Número de documentos"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
 
-    js <- jsonlite::fromJSON(content(res, as = "text", encoding = "UTF-8"),
-                             simplifyVector = FALSE)
+ggsave("outputs/figures/production_by_year_line.png", p_year_line, width = 8, height = 5, dpi = 150)
 
-    results <- js$results
-    next_cursor <- js$meta$next_cursor
-    n <- length(results)
+# 3.2 Citations by year (if present)
+df_cit_year <- filtered %>%
+  filter(!is.na(publication_year)) %>%
+  group_by(publication_year) %>%
+  summarise(total_citations = sum(cited_by_count, na.rm = TRUE), .groups = "drop") %>%
+  arrange(publication_year)
 
-    cat_line("Page ", page, "... results: ", n)
+p_cit <- ggplot(df_cit_year, aes(publication_year, total_citations)) +
+  geom_col() +
+  theme_minimal() +
+  labs(
+    title = "Citações totais por ano",
+    x = "Ano",
+    y = "Total de citações"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
 
-    if (n == 0) {
-      cat_line("No more results.")
-      break
-    }
+ggsave("outputs/figures/citations_by_year.png", p_cit, width = 8, height = 5, dpi = 150)
 
-    # Save each record as raw JSON line
-    for (i in seq_len(n)) append_jsonl(out_jsonl, results[[i]])
-    total_records <- total_records + n
-
-    if (is.null(next_cursor) || !nzchar(next_cursor)) {
-      cat_line("No next_cursor. Stopping.")
-      break
-    }
-
-    cursor <- next_cursor
-    Sys.sleep(delay_sec)
-  }
-
-  cat_line("\n✓ Data collection complete!")
-  cat_line("Total pages fetched: ", page)
-  cat_line("Total records: ", total_records)
-  cat_line("Output file: ", out_jsonl, "\n")
-
-  if (total_records == 0) {
-    stop(
-      "OpenAlex returned 0 records.\n",
-      "Try use_language_filter = FALSE (language filter may be too restrictive),\n",
-      "or simplify the search terms."
-    )
-  }
-
-  invisible(list(out_file = out_jsonl, pages = page, total_records = total_records))
-}
-
-# ----------------------------
-# STEP 2: Silver (JSONL → normalized tables)
-# ----------------------------
-build_silver_from_jsonl <- function(bronze_jsonl,
-                                   dir_silver = DIR_SILVER,
-                                   write_csv = TRUE,
-                                   keep_abstract_inverted_index_json = TRUE) {
-
-  cat_line("\n--- STEP 2: SILVER LAYER (Normalized Tables) ---")
-  cat_line("Building silver layer from: ", bronze_jsonl)
-
-  if (!file.exists(bronze_jsonl)) stop("Bronze file not found: ", bronze_jsonl)
-
-  lines <- readLines(bronze_jsonl, warn = FALSE)
-  cat_line("Total lines: ", length(lines))
-  if (length(lines) == 0) stop("Bronze JSONL has 0 lines: ", bronze_jsonl)
-
-  records <- purrr::map(lines, safe_fromJSON) |> purrr::compact()
-  cat_line("Total records parsed: ", length(records))
-  if (length(records) == 0) stop("Parsed 0 JSON records from bronze JSONL.")
-
-  # Works
-  cat_line("\nBuilding works table...")
-  works <- purrr::map_dfr(records, function(r) {
-    ai_json <- if (isTRUE(keep_abstract_inverted_index_json)) {
-      to_chr(r$abstract_inverted_index %||% NULL)
-    } else {
-      NA_character_
-    }
-
-    tibble(
-      work_id = r$id %||% NA_character_,
-      doi = r$doi %||% NA_character_,
-      title = r$title %||% NA_character_,
-      display_name = r$display_name %||% r$title %||% NA_character_,
-      abstract = normalize_abstract_text(r),  # ALWAYS character
-      abstract_inverted_index_json = ai_json, # optional (string JSON)
-      publication_year = r$publication_year %||% NA_integer_,
-      publication_date = r$publication_date %||% NA_character_,
-      type = r$type %||% NA_character_,
-      language = r$language %||% NA_character_,
-      cited_by_count = r$cited_by_count %||% NA_integer_,
-      is_oa = r$open_access$is_oa %||% NA,
-      source = r$host_venue$display_name %||% NA_character_
-    )
-  })
-
-  # Final type safety (extra hardening)
-  works <- works %>%
-    mutate(
-      abstract = to_chr(abstract),
-      abstract_inverted_index_json = to_chr(abstract_inverted_index_json)
-    )
-
-  cat_line("  Works: ", nrow(works))
-
-  # Authorships
-  cat_line("Building authorships table...")
-  authorships <- purrr::map_dfr(records, function(r) {
-    w <- r$id %||% NA_character_
-    auths <- r$authorships
-    if (is.null(auths) || length(auths) == 0) return(tibble())
-
-    purrr::map_dfr(auths, function(a) {
-      author_id <- a$author$id %||% NA_character_
-      author_name <- a$author$display_name %||% NA_character_
-
-      insts <- a$institutions
-      if (is.null(insts) || length(insts) == 0) {
-        tibble(
-          work_id = w,
-          author_id = author_id,
-          author_name = author_name,
-          institution_id = NA_character_,
-          institution_name = NA_character_,
-          institution_country_code = NA_character_
-        )
-      } else {
-        purrr::map_dfr(insts, function(i) {
-          tibble(
-            work_id = w,
-            author_id = author_id,
-            author_name = author_name,
-            institution_id = i$id %||% NA_character_,
-            institution_name = i$display_name %||% NA_character_,
-            institution_country_code = i$country_code %||% NA_character_
-          )
-        })
-      }
-    })
-  })
-  cat_line("  Authorships: ", nrow(authorships))
-
-  # Concepts
-  cat_line("Building concepts table...")
-  concepts <- purrr::map_dfr(records, function(r) {
-    w <- r$id %||% NA_character_
-    cs <- r$concepts
-    if (is.null(cs) || length(cs) == 0) return(tibble())
-    purrr::map_dfr(cs, function(cn) {
-      tibble(
-        work_id = w,
-        concept_id = cn$id %||% NA_character_,
-        concept_name = cn$display_name %||% NA_character_,
-        concept_level = cn$level %||% NA_integer_,
-        concept_score = cn$score %||% NA_real_
-      )
-    })
-  })
-  cat_line("  Concepts: ", nrow(concepts))
-
-  # References
-  cat_line("Building references table...")
-  references <- purrr::map_dfr(records, function(r) {
-    w <- r$id %||% NA_character_
-    refs <- r$referenced_works
-    if (is.null(refs) || length(refs) == 0) return(tibble())
-    tibble(
-      work_id = w,
-      referenced_work_id = unlist(refs)
-    )
-  })
-  cat_line("  References: ", nrow(references))
-
-  # Save Parquet
-  cat_line("\nSaving Parquet files...")
-  write_parquet(works, file.path(dir_silver, "works.parquet"))
-  write_parquet(authorships, file.path(dir_silver, "authorships.parquet"))
-  write_parquet(concepts, file.path(dir_silver, "concepts.parquet"))
-  write_parquet(references, file.path(dir_silver, "references.parquet"))
-  cat_line("✓ Silver layer complete!")
-
-  # Save CSV
-  if (isTRUE(write_csv)) {
-    cat_line("\nSaving CSV files...")
-    readr::write_csv(works, file.path(dir_silver, "works.csv"))
-    readr::write_csv(authorships, file.path(dir_silver, "authorships.csv"))
-    readr::write_csv(concepts, file.path(dir_silver, "concepts.csv"))
-    readr::write_csv(references, file.path(dir_silver, "references.csv"))
-    cat_line("✓ CSV files saved!")
-  }
-
-  invisible(list(works = works, authorships = authorships, concepts = concepts, references = references))
-}
-
-# ----------------------------
-# STEP 3: Gold (analytical tables)
-# ----------------------------
-build_gold <- function(silver, dir_gold = DIR_GOLD, write_csv = TRUE) {
-
-  cat_line("\n--- STEP 3: GOLD LAYER (Analytical Tables) ---")
-  cat_line("Building gold layer...")
-
-  works <- silver$works
-  concepts <- silver$concepts
-
-  production_by_year <- works |>
-    filter(!is.na(publication_year)) |>
-    count(publication_year, name = "n") |>
-    arrange(publication_year)
-
-  production_by_type <- works |>
-    mutate(type = if_else(is.na(type) | type == "", "unknown", type)) |>
-    count(type, name = "n") |>
-    arrange(desc(n))
-
-  top_sources <- works |>
-    mutate(source = if_else(is.na(source) | source == "", "unknown", source)) |>
-    count(source, name = "n") |>
-    arrange(desc(n)) |>
+# 3.3 Types
+if ("type" %in% names(filtered)) {
+  df_type <- filtered %>%
+    mutate(type = if_else(is.na(type) | !nzchar(type), "unknown", type)) %>%
+    count(type, name = "n") %>%
+    arrange(desc(n)) %>%
     slice_head(n = 20)
 
-  top_concepts <- concepts |>
-    filter(!is.na(concept_name) & concept_name != "") |>
-    count(concept_name, name = "n") |>
-    arrange(desc(n)) |>
-    slice_head(n = 30)
+  p_type <- ggplot(df_type, aes(reorder(type, n), n)) +
+    geom_col() +
+    coord_flip() +
+    theme_minimal() +
+    labs(
+      title = "Top tipos de documentos",
+      x = NULL,
+      y = "n"
+    )
 
-  concept_edges <- concepts |>
-    filter(!is.na(concept_name) & concept_name != "") |>
-    distinct(work_id, concept_name) |>
-    group_by(work_id) |>
-    summarise(concepts = list(sort(unique(concept_name))), .groups = "drop") |>
-    mutate(pairs = purrr::map(concepts, function(v) {
-      if (length(v) < 2) return(NULL)
-      combn(v, 2, simplify = FALSE)
-    })) |>
-    select(pairs) |>
-    tidyr::unnest(pairs) |>
-    mutate(
-      source = purrr::map_chr(pairs, 1),
-      target = purrr::map_chr(pairs, 2)
-    ) |>
-    select(source, target) |>
-    count(source, target, name = "weight") |>
-    arrange(desc(weight))
-
-  # Save
-  write_parquet(production_by_year, file.path(dir_gold, "production_by_year.parquet"))
-  write_parquet(production_by_type, file.path(dir_gold, "production_by_type.parquet"))
-  write_parquet(top_sources, file.path(dir_gold, "top_sources.parquet"))
-  write_parquet(top_concepts, file.path(dir_gold, "top_concepts.parquet"))
-  write_parquet(concept_edges, file.path(dir_gold, "concept_cooccurrence_edges.parquet"))
-
-  if (isTRUE(write_csv)) {
-    readr::write_csv(production_by_year, file.path(dir_gold, "production_by_year.csv"))
-    readr::write_csv(production_by_type, file.path(dir_gold, "production_by_type.csv"))
-    readr::write_csv(top_sources, file.path(dir_gold, "top_sources.csv"))
-    readr::write_csv(top_concepts, file.path(dir_gold, "top_concepts.csv"))
-    readr::write_csv(concept_edges, file.path(dir_gold, "concept_cooccurrence_edges.csv"))
-  }
-
-  cat_line("✓ Gold layer complete!")
-
-  invisible(list(
-    production_by_year = production_by_year,
-    production_by_type = production_by_type,
-    top_sources = top_sources,
-    top_concepts = top_concepts,
-    concept_cooccurrence_edges = concept_edges
-  ))
+  ggsave("outputs/figures/top_document_types.png", p_type, width = 8, height = 6, dpi = 150)
+  readr::write_csv(df_type, "outputs/tables/top_document_types.csv")
 }
 
-# ----------------------------
-# Public entry point: run everything
-# ----------------------------
-run_complete_extraction <- function(max_pages = NULL,
-                                    polite_email = "",
-                                    use_language_filter = TRUE,
-                                    per_page = 200,
-                                    delay_sec = 0.2,
-                                    write_csv = TRUE,
-                                    keep_abstract_inverted_index_json = TRUE) {
+cat_line("✓ Figuras salvas em outputs/figures/\n")
 
-  cat_line("================================================================================")
-  cat_line("COMPLETE DATA EXTRACTION PIPELINE")
-  cat_line("OpenAlex API → Bronze(JSONL raw) → Silver(Parquet/CSV) → Gold")
-  cat_line("================================================================================\n")
+# ==============================================================================
+# 4) Wordcloud in HTML (no Cairo/PNG dependency)
+# ==============================================================================
+cat_line("--- PARTE 4: Nuvem de palavras (HTML, robusta) ---")
 
-  q <- build_openalex_query(use_language_filter = use_language_filter)
-
-  bronze_file <- file.path(DIR_BRONZE, paste0("openalex_bronze_", timestamp_now(), ".jsonl"))
-
-  t0 <- Sys.time()
-
-  bronze <- collect_openalex_bronze(
-    out_jsonl = bronze_file,
-    search_query = q$search,
-    filter_query = q$filter,
-    polite_email = polite_email,
-    per_page = per_page,
-    delay_sec = delay_sec,
-    max_pages = if (is.null(max_pages)) Inf else max_pages
-  )
-
-  silver <- build_silver_from_jsonl(
-    bronze_jsonl = bronze$out_file,
-    write_csv = write_csv,
-    keep_abstract_inverted_index_json = keep_abstract_inverted_index_json
-  )
-
-  gold <- build_gold(silver = silver, write_csv = write_csv)
-
-  t1 <- Sys.time()
-
-  cat_line("\n================================================================================")
-  cat_line("✓ PIPELINE COMPLETE!")
-  cat_line("================================================================================")
-  cat_line("Elapsed time: ", round(as.numeric(difftime(t1, t0, units = "mins")), 3), " minutes\n")
-
-  list(
-    bronze = bronze$out_file,
-    silver = list(
-      works = file.path(DIR_SILVER, "works.parquet"),
-      authorships = file.path(DIR_SILVER, "authorships.parquet"),
-      concepts = file.path(DIR_SILVER, "concepts.parquet"),
-      references = file.path(DIR_SILVER, "references.parquet")
+# Choose text source: prefer abstract, else title
+text_for_wc <- filtered %>%
+  mutate(
+    .wc_text = case_when(
+      !is.na(abstract) & nzchar(abstract) ~ abstract,
+      !is.na(title) & nzchar(title) ~ title,
+      TRUE ~ display_name
     ),
-    gold = list(
-      production_by_year = file.path(DIR_GOLD, "production_by_year.parquet"),
-      production_by_type = file.path(DIR_GOLD, "production_by_type.parquet"),
-      top_sources = file.path(DIR_GOLD, "top_sources.parquet"),
-      top_concepts = file.path(DIR_GOLD, "top_concepts.parquet"),
-      concept_cooccurrence_edges = file.path(DIR_GOLD, "concept_cooccurrence_edges.parquet")
-    ),
-    elapsed_time = difftime(t1, t0, units = "mins")
-  )
+    .wc_text = norm_txt(.wc_text)
+  ) %>%
+  filter(nzchar(.wc_text)) %>%
+  pull(.wc_text)
+
+if (length(text_for_wc) == 0) {
+  cat_line("⚠ Sem texto suficiente para wordcloud. Pulando.\n")
+} else {
+  corpus <- tm::VCorpus(tm::VectorSource(text_for_wc))
+  corpus <- tm::tm_map(corpus, tm::removePunctuation)
+  corpus <- tm::tm_map(corpus, tm::removeNumbers)
+  corpus <- tm::tm_map(corpus, tm::removeWords, tm::stopwords("portuguese"))
+  corpus <- tm::tm_map(corpus, tm::stripWhitespace)
+  corpus <- corpus[sapply(corpus, function(x) nchar(trimws(x$content)) > 0)]
+
+  tdm <- tm::TermDocumentMatrix(corpus)
+  m <- as.matrix(tdm)
+  word_freq <- sort(rowSums(m), decreasing = TRUE)
+
+  df_words <- tibble(
+    word = names(word_freq),
+    freq = as.numeric(word_freq)
+  ) %>%
+    filter(nchar(word) >= 3) %>%
+    slice_head(n = 250)
+
+  readr::write_csv(df_words, "outputs/tables/word_frequency_top250.csv")
+
+  wc <- wordcloud2::wordcloud2(df_words, size = 0.7)
+  htmlwidgets::saveWidget(wc, "outputs/figures/wordcloud.html", selfcontained = TRUE)
+
+  cat_line("✓ Wordcloud salva em outputs/figures/wordcloud.html")
+  cat_line("  (Abra esse arquivo no VS Code / browser)\n")
 }
+
+cat_line("✓ Análise exploratória finalizada.")
