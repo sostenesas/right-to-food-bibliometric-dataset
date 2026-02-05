@@ -1,409 +1,358 @@
 # ==============================================================================
-# SCRIPT: Análise Exploratória Bibliométrica
-# Arquivo: R/analysis/exploratory_analysis.R
-# Descrição: Análise bibliométrica com visualizações e análise de texto
+# SCRIPT: Exploratory bibliometric analysis (robust + HTML wordcloud)
+# File: R/analysis/exploratory_analysis.R
 # ==============================================================================
 
-# --- Carrega Pacotes ---
 suppressPackageStartupMessages({
   library(tidyverse)
-  library(arrow)         # Para ler Parquet
-  library(ggwordcloud)
+  library(arrow)
+  library(stringi)      # for accent removal (Latin-ASCII)
   library(tm)
-  library(readxl)
-  library(writexl)
+  library(htmlwidgets)
 })
 
-# --- Configurações ---
-cat("=== ANÁLISE EXPLORATÓRIA BIBLIOMÉTRICA ===\n\n")
-
-# Detectar diretório de trabalho
-if (rstudioapi::isAvailable()) {
-  project_root <- dirname(dirname(rstudioapi::getActiveDocumentContext()$path))
-} else {
-  project_root <- getwd()
-  if (basename(project_root) == "analysis") {
-    project_root <- dirname(dirname(project_root))
+# Optional packages: we try to load/install if missing
+ensure_pkg <- function(pkg) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg, repos = "https://cloud.r-project.org")
   }
 }
 
+ensure_pkg("wordcloud2")  # HTML wordcloud
+# htmlwidgets is already loaded above, but keep safe
+ensure_pkg("htmlwidgets")
+
+# ----------------------------
+# Helpers
+# ----------------------------
+cat_line <- function(...) cat(..., "\n", sep = "")
+ensure_dir <- function(path) if (!dir.exists(path)) dir.create(path, recursive = TRUE, showWarnings = FALSE)
+
+# Normalize text for robust matching (lower + remove accents + squish)
+norm_txt <- function(x) {
+  x <- ifelse(is.na(x), "", x)
+  x <- tolower(x)
+  x <- stringi::stri_trans_general(x, "Latin-ASCII")
+  x <- stringr::str_squish(x)
+  x
+}
+
+# Robust "contains any keyword" (fixed match, no regex surprises)
+contains_any <- function(txt, keys_norm) {
+  if (is.na(txt) || !nzchar(txt)) return(FALSE)
+  any(stringr::str_detect(txt, stringr::fixed(keys_norm)))
+}
+
+# Try to detect project root
+detect_project_root <- function() {
+  # If running under RStudio
+  if (requireNamespace("rstudioapi", quietly = TRUE) && rstudioapi::isAvailable()) {
+    p <- rstudioapi::getActiveDocumentContext()$path
+    if (!is.null(p) && nzchar(p)) return(dirname(dirname(p)))
+  }
+  # fallback: current wd
+  getwd()
+}
+
+# ==============================================================================
+# 0) Setup
+# ==============================================================================
+cat_line("=== ANÁLISE EXPLORATÓRIA BIBLIOMÉTRICA (ROBUST) ===\n")
+
+project_root <- detect_project_root()
 setwd(project_root)
-cat("Diretório do projeto:", getwd(), "\n\n")
 
-# Criar diretórios de saída
-dir.create("outputs/figures", recursive = TRUE, showWarnings = FALSE)
-dir.create("outputs/tables", recursive = TRUE, showWarnings = FALSE)
+cat_line("Diretório do projeto: ", getwd(), "\n")
+
+ensure_dir("outputs/figures")
+ensure_dir("outputs/tables")
+ensure_dir("outputs/reports")
 
 # ==============================================================================
-# PARTE 1: CARREGAMENTO DE DADOS
+# 1) Load data
 # ==============================================================================
+cat_line("--- PARTE 1: Carregamento de Dados ---")
 
-cat("--- PARTE 1: Carregamento de Dados ---\n")
-
-# Opção 1: Dados do pipeline (Parquet) - RECOMENDADO
 silver_works <- "data/silver/works.parquet"
+silver_authorships <- "data/silver/authorships.parquet"
+silver_concepts <- "data/silver/concepts.parquet"
+silver_references <- "data/silver/references.parquet"
 
-# Opção 2: Dados brutos (Excel) - FALLBACK
-raw_excel <- "data/raw/plan_art_dt_alim_nova.xlsx"
-
-# Tentar carregar da camada Silver primeiro
-if (file.exists(silver_works)) {
-  cat("✓ Carregando dados da camada Silver (Parquet)...\n")
-  
-  df_works <- read_parquet(silver_works)
-  
-  # Se precisar de mais dados, carregar authorships e concepts
-  if (file.exists("data/silver/authorships.parquet")) {
-    df_authorships <- read_parquet("data/silver/authorships.parquet")
-  }
-  
-  if (file.exists("data/silver/concepts.parquet")) {
-    df_concepts <- read_parquet("data/silver/concepts.parquet")
-  }
-  
-  # Adaptar nomes de colunas para compatibilidade com script original
-  if ("work_id" %in% names(df_works)) {
-    df_rev_alim <- df_works %>%
-      rename(
-        id = work_id,
-        title = title  # Ajustar conforme estrutura real
-      )
-  } else {
-    df_rev_alim <- df_works
-  }
-  
-  cat("✓ Dados carregados:", nrow(df_rev_alim), "documentos\n\n")
-  
-} else if (file.exists(raw_excel)) {
-  cat("⚠ Dados Silver não encontrados. Carregando Excel bruto...\n")
-  
-  df_rev_alim <- read_xlsx(raw_excel)
-  
-  cat("✓ Dados carregados:", nrow(df_rev_alim), "documentos\n\n")
-  
-} else {
-  stop("❌ Nenhuma fonte de dados encontrada!\n",
-       "Coloque seu arquivo Excel em: data/raw/plan_art_dt_alim.xlsx\n",
-       "Ou execute o pipeline de extração primeiro: source('R/complete_extraction.R')")
+if (!file.exists(silver_works)) {
+  stop("❌ Não encontrei: ", silver_works, "\nRode primeiro o pipeline de extração.")
 }
 
-# ==============================================================================
-# PARTE 2: FILTRAGEM TEMÁTICA
-# ==============================================================================
+cat_line("✓ Carregando dados da camada Silver (Parquet)...")
+works <- read_parquet(silver_works)
 
-cat("--- PARTE 2: Filtragem Temática ---\n")
+# Load optional tables if present
+authorships <- if (file.exists(silver_authorships)) read_parquet(silver_authorships) else NULL
+concepts <- if (file.exists(silver_concepts)) read_parquet(silver_concepts) else NULL
+references <- if (file.exists(silver_references)) read_parquet(silver_references) else NULL
 
-# Palavras-chave
+cat_line("✓ Dados carregados: ", nrow(works), " documentos\n")
+
+# ==============================================================================
+# 1.1) Schema compatibility / safety
+# ==============================================================================
+# Make sure essential columns exist
+if (!"id" %in% names(works) && "work_id" %in% names(works)) {
+  works <- works %>% rename(id = work_id)
+}
+if (!"work_id" %in% names(works) && "id" %in% names(works)) {
+  works <- works %>% rename(work_id = id)
+}
+
+# Ensure title/display_name exist (for older scripts / compatibility)
+if (!"title" %in% names(works)) works$title <- NA_character_
+if (!"display_name" %in% names(works)) works$display_name <- NA_character_
+
+# If one exists, backfill the other
+works <- works %>%
+  mutate(
+    title = ifelse(is.na(title) | !nzchar(title), display_name, title),
+    display_name = ifelse(is.na(display_name) | !nzchar(display_name), title, display_name)
+  )
+
+# Ensure abstract exists
+if (!"abstract" %in% names(works)) works$abstract <- NA_character_
+
+# Ensure year/citations exist
+if (!"publication_year" %in% names(works)) works$publication_year <- NA_integer_
+if (!"cited_by_count" %in% names(works)) works$cited_by_count <- NA_real_
+
+# Coerce types safely
+works <- works %>%
+  mutate(
+    publication_year = suppressWarnings(as.integer(publication_year)),
+    cited_by_count = suppressWarnings(as.numeric(cited_by_count))
+  )
+
+# ==============================================================================
+# 2) Robust thematic filtering
+# ==============================================================================
+cat_line("--- PARTE 2: Filtragem Temática (robusta) ---")
+
+# Keywords: keep in PT + EN, but match will happen on normalized (no accents)
 keywords <- c(
-  "direito à alimentação", 
-  "direito humano à alimentação", 
-  "direito social à alimentação",
-  "segurança alimentar", 
-  "segurança nutricional", 
+  "direito à alimentação",
+  "direito humano à alimentação",
+  "direito à alimentação adequada",
+  "segurança alimentar",
   "segurança alimentar e nutricional",
-  "alimentação adequada", 
-  "soberania alimentar"
+  "insegurança alimentar",
+  "soberania alimentar",
+  "right to food",
+  "human right to food",
+  "food security",
+  "food insecurity"
 )
 
-pattern <- paste(keywords, collapse = "|")
+keywords_norm <- norm_txt(keywords)
 
-# Verificar se coluna abstract existe
-if (!"abstract" %in% names(df_rev_alim)) {
-  # Tentar usar title ou display_name
-  if ("title" %in% names(df_rev_alim)) {
-    df_rev_alim$abstract <- df_rev_alim$title
-    cat("⚠ Coluna 'abstract' não encontrada. Usando 'title' para filtragem.\n")
-  } else if ("display_name" %in% names(df_rev_alim)) {
-    df_rev_alim$abstract <- df_rev_alim$display_name
-    cat("⚠ Coluna 'abstract' não encontrada. Usando 'display_name' para filtragem.\n")
-  } else {
-    stop("❌ Não foi possível encontrar campo de texto para filtragem.")
-  }
+# Build combined searchable text
+works <- works %>%
+  mutate(
+    .text_raw = paste(
+      coalesce(title, ""),
+      coalesce(display_name, ""),
+      coalesce(abstract, ""),
+      sep = " "
+    ),
+    .text_norm = norm_txt(.text_raw)
+  )
+
+filtered <- works %>%
+  filter(purrr::map_lgl(.text_norm, contains_any, keys_norm = keywords_norm))
+
+cat_line("✓ Documentos após filtragem: ", nrow(filtered))
+cat_line("  Taxa de retenção: ", round(nrow(filtered) / nrow(works) * 100, 1), "%\n")
+
+# If filter returns zero, do diagnostics and continue with full dataset
+if (nrow(filtered) == 0) {
+  cat_line("⚠ Nenhum documento após filtragem. Vou gerar diagnóstico e seguir sem filtro.\n")
+
+  # show examples of normalized text to help user adjust keywords
+  examples <- works %>%
+    filter(!is.na(.text_norm) & nzchar(.text_norm)) %>%
+    slice_head(n = 8) %>%
+    transmute(example = substr(.text_norm, 1, 220))
+
+  readr::write_csv(examples, "outputs/reports/filter_diagnostic_examples.csv")
+  cat_line("✓ Exemplos salvos em outputs/reports/filter_diagnostic_examples.csv")
+
+  # Also compute candidate terms (top 50) from titles/abstracts
+  text_diag <- works %>%
+    transmute(txt = norm_txt(paste(coalesce(title, ""), coalesce(abstract, "")))) %>%
+    filter(nzchar(txt)) %>%
+    pull(txt)
+
+  # Keep it light: just tokenise with stringr (no tidytext dependency)
+  tokens <- unlist(strsplit(text_diag, "\\s+"))
+  tokens <- tokens[nchar(tokens) >= 4]
+  # remove very common stopwords (already normalized, so use ASCII)
+  stop_basic <- c("para","pela","pelo","sobre","entre","como","mais","menos","aqui",
+                  "da","de","do","das","dos","uma","um","uns","umas","que","com","sem",
+                  "nos","nas","na","no","em","por","ao","aos","as","os","e","ou","se",
+                  "sua","seu","suas","seus","tambem","sao","ser","foi","tem","tendo",
+                  "direito","alimentacao") # you can remove this if you want to keep
+  tokens <- tokens[!tokens %in% stop_basic]
+  top_tokens <- sort(table(tokens), decreasing = TRUE)
+  df_top_tokens <- tibble(
+    token = names(top_tokens)[1:min(80, length(top_tokens))],
+    freq = as.integer(top_tokens[1:min(80, length(top_tokens))])
+  )
+  readr::write_csv(df_top_tokens, "outputs/reports/filter_diagnostic_top_tokens.csv")
+  cat_line("✓ Top tokens salvos em outputs/reports/filter_diagnostic_top_tokens.csv\n")
+
+  # Continue with full dataset
+  filtered <- works
+  cat_line("✓ Prosseguindo com a base completa (sem filtro) para gerar outputs.\n")
 }
 
-# Filtrar
-df_rev_alim1 <- df_rev_alim %>%
-  filter(!is.na(abstract)) %>%
-  filter(grepl(pattern, abstract, ignore.case = TRUE))
+# Save filtered set (for traceability)
+readr::write_csv(
+  filtered %>% select(work_id, doi, title, display_name, publication_year, cited_by_count, type, language, source),
+  "outputs/tables/works_filtered_minimal.csv"
+)
 
-cat("✓ Documentos após filtragem:", nrow(df_rev_alim1), "\n")
-cat("  Taxa de retenção:", 
-    round(nrow(df_rev_alim1) / nrow(df_rev_alim) * 100, 1), "%\n\n")
+# Narrative review candidates (>=10 citations)
+narrative <- filtered %>%
+  filter(!is.na(cited_by_count) & cited_by_count >= 10) %>%
+  arrange(desc(cited_by_count))
 
-# Calcular número de autores (se coluna existir)
-if ("authorships.raw_author_name" %in% names(df_rev_alim1)) {
-  df_rev_alim1 <- df_rev_alim1 %>%
-    mutate(n_author = str_count(authorships.raw_author_name, "\\|") + 1)
-}
+readr::write_csv(
+  narrative %>% select(work_id, doi, title, publication_year, cited_by_count, source),
+  "outputs/tables/narrative_candidates_citations_ge10.csv"
+)
 
-# Criar subset para revisão narrativa (>= 10 citações)
-if ("cited_by_count" %in% names(df_rev_alim1)) {
-  df_rev_alim2 <- df_rev_alim1 %>%
-    filter(!is.na(publication_year)) %>%
-    filter(as.numeric(cited_by_count) >= 10)
-  
-  cat("✓ Documentos para revisão narrativa (≥10 citações):", 
-      nrow(df_rev_alim2), "\n\n")
-}
+cat_line("✓ Documentos para revisão narrativa (≥10 citações): ", nrow(narrative), "\n")
 
 # ==============================================================================
-# PARTE 3: VISUALIZAÇÕES
+# 3) Visualizations
 # ==============================================================================
+cat_line("--- PARTE 3: Visualizações ---")
 
-cat("--- PARTE 3: Gerando Visualizações ---\n")
-
-# Verificar se temos dados suficientes
-if (nrow(df_rev_alim1) == 0) {
-  stop("❌ Nenhum documento após filtragem. Ajuste as palavras-chave.")
-}
-
-# --- Gráfico 1: Artigos por Ano (Barras) ---
-cat("  Gráfico 1: Produção por ano (barras)...\n")
-
-df_articles_per_year <- df_rev_alim1 %>%
+# 3.1 Production by year
+df_year <- filtered %>%
   filter(!is.na(publication_year)) %>%
-  count(publication_year)
+  count(publication_year, name = "n") %>%
+  arrange(publication_year)
 
-p1 <- ggplot(df_articles_per_year, aes(x = publication_year, y = n)) +
-  geom_col(fill = "steelblue") +
+p_year_bar <- ggplot(df_year, aes(publication_year, n)) +
+  geom_col() +
   theme_minimal() +
   labs(
-    x = "Ano de Publicação",
-    y = "Número de Artigos",
-    title = "Produção Acadêmica por Ano",
-    subtitle = paste0("Total: ", nrow(df_rev_alim1), " documentos (2014-2023)")
+    title = "Produção por ano",
+    x = "Ano",
+    y = "Número de documentos"
   ) +
-  theme(
-    plot.title = element_text(face = "bold", hjust = 0.5, size = 14),
-    plot.subtitle = element_text(hjust = 0.5),
-    axis.text.x = element_text(angle = 45, hjust = 1)
-  )
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
 
-ggsave("outputs/figures/articles_per_year_bar.png", p1, 
-       width = 8, height = 6, dpi = 300)
+ggsave("outputs/figures/production_by_year_bar.png", p_year_bar, width = 8, height = 5, dpi = 150)
 
-# --- Gráfico 2: Evolução Temporal (Linha) ---
-cat("  Gráfico 2: Evolução temporal (linha)...\n")
-
-p2 <- ggplot(df_articles_per_year, aes(x = publication_year, y = n)) +
-  geom_line(group = 1, color = "darkred", size = 1) +
-  geom_point(color = "darkred", size = 3) +
+p_year_line <- ggplot(df_year, aes(publication_year, n)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
   theme_minimal() +
   labs(
-    x = "Ano de Publicação",
-    y = "Número de Artigos",
-    title = "Evolução da Produção Acadêmica",
-    subtitle = "Tendência temporal 2014-2023"
+    title = "Evolução temporal da produção",
+    x = "Ano",
+    y = "Número de documentos"
   ) +
-  theme(
-    plot.title = element_text(face = "bold", hjust = 0.5, size = 14),
-    plot.subtitle = element_text(hjust = 0.5),
-    axis.text.x = element_text(angle = 45, hjust = 1)
-  )
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
 
-ggsave("outputs/figures/articles_per_year_line.png", p2, 
-       width = 8, height = 6, dpi = 300)
+ggsave("outputs/figures/production_by_year_line.png", p_year_line, width = 8, height = 5, dpi = 150)
 
-# --- Gráfico 3: Citações por Ano ---
-if ("cited_by_count" %in% names(df_rev_alim1)) {
-  cat("  Gráfico 3: Citações por ano...\n")
-  
-  p3 <- df_rev_alim1 %>%
-    filter(!is.na(publication_year)) %>%
-    group_by(publication_year) %>%
-    summarise(total_citations = sum(as.numeric(cited_by_count), na.rm = TRUE)) %>%
-    ggplot(aes(x = publication_year, y = total_citations)) +
-    geom_col(fill = "forestgreen") +
+# 3.2 Citations by year (if present)
+df_cit_year <- filtered %>%
+  filter(!is.na(publication_year)) %>%
+  group_by(publication_year) %>%
+  summarise(total_citations = sum(cited_by_count, na.rm = TRUE), .groups = "drop") %>%
+  arrange(publication_year)
+
+p_cit <- ggplot(df_cit_year, aes(publication_year, total_citations)) +
+  geom_col() +
+  theme_minimal() +
+  labs(
+    title = "Citações totais por ano",
+    x = "Ano",
+    y = "Total de citações"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave("outputs/figures/citations_by_year.png", p_cit, width = 8, height = 5, dpi = 150)
+
+# 3.3 Types
+if ("type" %in% names(filtered)) {
+  df_type <- filtered %>%
+    mutate(type = if_else(is.na(type) | !nzchar(type), "unknown", type)) %>%
+    count(type, name = "n") %>%
+    arrange(desc(n)) %>%
+    slice_head(n = 20)
+
+  p_type <- ggplot(df_type, aes(reorder(type, n), n)) +
+    geom_col() +
+    coord_flip() +
     theme_minimal() +
     labs(
-      x = "Ano de Publicação",
-      y = "Total de Citações",
-      title = "Citações Acumuladas por Ano",
-      subtitle = "Soma das citações recebidas por artigos publicados em cada ano"
-    ) +
-    theme(
-      plot.title = element_text(face = "bold", hjust = 0.5, size = 14),
-      plot.subtitle = element_text(hjust = 0.5),
-      axis.text.x = element_text(angle = 45, hjust = 1)
+      title = "Top tipos de documentos",
+      x = NULL,
+      y = "n"
     )
-  
-  ggsave("outputs/figures/citations_per_year.png", p3, 
-         width = 8, height = 6, dpi = 300)
+
+  ggsave("outputs/figures/top_document_types.png", p_type, width = 8, height = 6, dpi = 150)
+  readr::write_csv(df_type, "outputs/tables/top_document_types.csv")
 }
 
-# --- Gráfico 4: FWCI vs Citações ---
-if (all(c("fwci", "cited_by_count") %in% names(df_rev_alim1))) {
-  cat("  Gráfico 4: FWCI vs citações...\n")
-  
-  p4 <- df_rev_alim1 %>%
-    filter(!is.na(fwci), !is.na(cited_by_count)) %>%
-    ggplot(aes(x = as.numeric(fwci), y = as.numeric(cited_by_count))) +
-    geom_point(color = "darkblue", alpha = 0.7) +
-    geom_smooth(method = "lm", color = "red", se = TRUE) +
-    theme_minimal() +
-    labs(
-      x = "Field-Weighted Citation Impact (FWCI)",
-      y = "Número de Citações",
-      title = "Relação entre FWCI e Citações",
-      subtitle = "Dispersão com regressão linear"
-    ) +
-    theme(
-      plot.title = element_text(face = "bold", hjust = 0.5, size = 14),
-      plot.subtitle = element_text(hjust = 0.5)
-    )
-  
-  ggsave("outputs/figures/fwci_vs_citations.png", p4, 
-         width = 8, height = 6, dpi = 300)
-}
+cat_line("✓ Figuras salvas em outputs/figures/\n")
 
 # ==============================================================================
-# PARTE 4: ANÁLISE DE TEXTO (Nuvem de Palavras)
+# 4) Wordcloud in HTML (no Cairo/PNG dependency)
 # ==============================================================================
+cat_line("--- PARTE 4: Nuvem de palavras (HTML, robusta) ---")
 
-cat("  Gráfico 5: Nuvem de palavras...\n")
+# Choose text source: prefer abstract, else title
+text_for_wc <- filtered %>%
+  mutate(
+    .wc_text = case_when(
+      !is.na(abstract) & nzchar(abstract) ~ abstract,
+      !is.na(title) & nzchar(title) ~ title,
+      TRUE ~ display_name
+    ),
+    .wc_text = norm_txt(.wc_text)
+  ) %>%
+  filter(nzchar(.wc_text)) %>%
+  pull(.wc_text)
 
-# Verificar se há abstracts válidos
-valid_abstracts <- df_rev_alim1 %>%
-  filter(!is.na(abstract), nchar(abstract) > 10) %>%
-  pull(abstract)
-
-if (length(valid_abstracts) > 0) {
-  
-  # Criar corpus
-  corpus <- Corpus(VectorSource(valid_abstracts))
-  
-  # Limpar texto
-  corpus <- corpus %>%
-    tm_map(content_transformer(tolower)) %>%
-    tm_map(removePunctuation) %>%
-    tm_map(removeNumbers) %>%
-    tm_map(removeWords, stopwords("portuguese")) %>%
-    tm_map(stripWhitespace)
-  
-  # Stopwords customizadas
-  custom_stopwords <- c(
-    "artigo", "estudo", "pesquisa", "resultados", "métodos",
-    "dados", "análise", "pode", "sido", "estar", "ainda",
-    "também", "deve", "dessa", "dessa", "assim", "mais"
-  )
-  corpus <- tm_map(corpus, removeWords, custom_stopwords)
-  
-  # Matriz de termos
-  dtm <- TermDocumentMatrix(corpus)
-  m <- as.matrix(dtm)
-  word_freqs <- sort(rowSums(m), decreasing = TRUE)
-  df_words <- data.frame(
-    word = names(word_freqs), 
-    freq = word_freqs,
-    row.names = NULL
-  )
-  
-  # Nuvem de palavras
-  p5 <- df_words %>%
-    filter(freq >= 3) %>%  # Mínimo 3 ocorrências
-    top_n(50, freq) %>%
-    ggplot(aes(label = word, size = freq, color = freq)) +
-    geom_text_wordcloud(area_corr_power = 1, shape = "circle") +
-    scale_size_area(max_size = 12) +
-    scale_color_viridis_c(option = "plasma") +
-    theme_minimal() +
-    labs(
-      title = "Nuvem de Palavras dos Abstracts",
-      subtitle = paste0("50 palavras mais frequentes (n=", 
-                       length(valid_abstracts), " documentos)")
-    ) +
-    theme(
-      plot.title = element_text(face = "bold", hjust = 0.5, size = 14),
-      plot.subtitle = element_text(hjust = 0.5)
-    )
-  
-  ggsave("outputs/figures/wordcloud_abstracts.png", p5, 
-         width = 8, height = 6, dpi = 300)
-  
-  # Salvar frequências
-  write_csv(df_words, "outputs/tables/word_frequencies.csv")
-  
+if (length(text_for_wc) == 0) {
+  cat_line("⚠ Sem texto suficiente para wordcloud. Pulando.\n")
 } else {
-  cat("  ⚠ Sem abstracts válidos para nuvem de palavras.\n")
+  corpus <- tm::VCorpus(tm::VectorSource(text_for_wc))
+  corpus <- tm::tm_map(corpus, tm::removePunctuation)
+  corpus <- tm::tm_map(corpus, tm::removeNumbers)
+  corpus <- tm::tm_map(corpus, tm::removeWords, tm::stopwords("portuguese"))
+  corpus <- tm::tm_map(corpus, tm::stripWhitespace)
+  corpus <- corpus[sapply(corpus, function(x) nchar(trimws(x$content)) > 0)]
+
+  tdm <- tm::TermDocumentMatrix(corpus)
+  m <- as.matrix(tdm)
+  word_freq <- sort(rowSums(m), decreasing = TRUE)
+
+  df_words <- tibble(
+    word = names(word_freq),
+    freq = as.numeric(word_freq)
+  ) %>%
+    filter(nchar(word) >= 3) %>%
+    slice_head(n = 250)
+
+  readr::write_csv(df_words, "outputs/tables/word_frequency_top250.csv")
+
+  wc <- wordcloud2::wordcloud2(df_words, size = 0.7)
+  htmlwidgets::saveWidget(wc, "outputs/figures/wordcloud.html", selfcontained = TRUE)
+
+  cat_line("✓ Wordcloud salva em outputs/figures/wordcloud.html")
+  cat_line("  (Abra esse arquivo no VS Code / browser)\n")
 }
 
-cat("✓ Visualizações salvas em outputs/figures/\n\n")
-
-# ==============================================================================
-# PARTE 5: SALVAR BASES INTERMEDIÁRIAS
-# ==============================================================================
-
-cat("--- PARTE 5: Salvando Bases Intermediárias ---\n")
-
-# Salvar em Excel
-write_xlsx(df_rev_alim1, "outputs/tables/base_filtrada.xlsx")
-cat("✓ Base filtrada salva:", nrow(df_rev_alim1), "documentos\n")
-
-if (exists("df_rev_alim2")) {
-  write_xlsx(df_rev_alim2, "outputs/tables/base_revisao_narrativa.xlsx")
-  cat("✓ Base revisão narrativa salva:", nrow(df_rev_alim2), "documentos\n")
-}
-
-# Salvar também em Parquet (mais eficiente)
-if (!dir.exists("data/gold")) dir.create("data/gold", recursive = TRUE)
-write_parquet(df_rev_alim1, "data/gold/filtered_works.parquet")
-
-# ==============================================================================
-# PARTE 6: ESTATÍSTICAS DESCRITIVAS
-# ==============================================================================
-
-cat("\n--- PARTE 6: Estatísticas Descritivas ---\n")
-
-stats <- list(
-  total_docs = nrow(df_rev_alim1),
-  anos = range(df_rev_alim1$publication_year, na.rm = TRUE),
-  media_cit = mean(as.numeric(df_rev_alim1$cited_by_count), na.rm = TRUE),
-  mediana_cit = median(as.numeric(df_rev_alim1$cited_by_count), na.rm = TRUE)
-)
-
-cat("Total de documentos:", stats$total_docs, "\n")
-cat("Período:", paste(stats$anos, collapse = "-"), "\n")
-cat("Média de citações:", round(stats$media_cit, 1), "\n")
-cat("Mediana de citações:", stats$mediana_cit, "\n")
-
-# Salvar estatísticas
-saveRDS(stats, "outputs/tables/descriptive_stats.rds")
-
-# ==============================================================================
-# RESUMO FINAL
-# ==============================================================================
-
-cat("\n===============================================\n")
-cat("✅ ANÁLISE EXPLORATÓRIA COMPLETA!\n")
-cat("===============================================\n\n")
-
-cat("Outputs gerados:\n")
-cat("📊 Figuras:\n")
-cat("  - outputs/figures/articles_per_year_bar.png\n")
-cat("  - outputs/figures/articles_per_year_line.png\n")
-if (file.exists("outputs/figures/citations_per_year.png")) {
-  cat("  - outputs/figures/citations_per_year.png\n")
-}
-if (file.exists("outputs/figures/fwci_vs_citations.png")) {
-  cat("  - outputs/figures/fwci_vs_citations.png\n")
-}
-if (file.exists("outputs/figures/wordcloud_abstracts.png")) {
-  cat("  - outputs/figures/wordcloud_abstracts.png\n")
-}
-
-cat("\n📋 Tabelas:\n")
-cat("  - outputs/tables/base_filtrada.xlsx\n")
-if (file.exists("outputs/tables/base_revisao_narrativa.xlsx")) {
-  cat("  - outputs/tables/base_revisao_narrativa.xlsx\n")
-}
-if (file.exists("outputs/tables/word_frequencies.csv")) {
-  cat("  - outputs/tables/word_frequencies.csv\n")
-}
-
-cat("\n💾 Dados processados:\n")
-cat("  - data/gold/filtered_works.parquet\n")
-
-cat("\n")
-
-# Liberar memória
-gc(verbose = FALSE)
+cat_line("✓ Análise exploratória finalizada.")
