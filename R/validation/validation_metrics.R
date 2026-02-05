@@ -206,38 +206,53 @@ document_schema <- function(silver_dir = "data/silver") {
 }
 
 # ==============================================================================
-# 4. NETWORK VALIDATION
+# 4. NETWORK VALIDATION (ROBUST TO SCHEMA)
 # ==============================================================================
 
 validate_network <- function(gold_dir = "data/gold") {
-  
+
   cat("Validating concept co-occurrence network...\n")
-  
+
   edges_path <- file.path(gold_dir, "concept_cooccurrence_edges.parquet")
-  
+
   if (!file.exists(edges_path)) {
-    cat("Warning: concept_cooccurrence_edges.parquet not found. Skipping network validation.\n")
+    cat("Warning: concept_cooccurrence_edges.parquet not found. Skipping.\n")
     return(NULL)
   }
-  
+
   edges <- read_parquet(edges_path)
-  
+
   if (nrow(edges) == 0) {
-    cat("Warning: No edges in network. Skipping validation.\n")
+    cat("Warning: No edges in network. Skipping.\n")
     return(NULL)
   }
-  
-  # Build graph
+
+  # ---- Robust schema handling ----
+  if (all(c("source", "target") %in% names(edges))) {
+    from <- edges$source
+    to   <- edges$target
+  } else if (all(c("concept_name_a", "concept_name_b") %in% names(edges))) {
+    from <- edges$concept_name_a
+    to   <- edges$concept_name_b
+  } else {
+    stop(
+      "❌ Unrecognized edge schema.\n",
+      "Columns found: ", paste(names(edges), collapse = ", "), "\n",
+      "Expected: (source,target[,weight]) OR (concept_name_a,concept_name_b[,weight])"
+    )
+  }
+
+  weight <- if ("weight" %in% names(edges)) edges$weight else rep(1, length(from))
+
+  # Sanity check
+  stopifnot(length(from) == length(to), length(from) == length(weight))
+
   g <- graph_from_data_frame(
-    d = data.frame(
-      from = edges$concept_name_a,
-      to = edges$concept_name_b,
-      weight = edges$weight
-    ),
+    d = data.frame(from = from, to = to, weight = weight),
     directed = FALSE
   )
-  
-  # Calculate network metrics
+
+  # ---- Network metrics ----
   metrics <- list(
     n_nodes = vcount(g),
     n_edges = ecount(g),
@@ -247,13 +262,13 @@ validate_network <- function(gold_dir = "data/gold") {
     diameter = diameter(g, weights = NA),
     avg_path_length = mean_distance(g, weights = NA)
   )
-  
+
   # Clustering
   set.seed(42)
   cl <- cluster_louvain(g, weights = E(g)$weight)
-  metrics$n_clusters = length(cl)
-  metrics$modularity = modularity(cl)
-  
+  metrics$n_clusters <- length(cl)
+  metrics$modularity <- modularity(cl)
+
   # Degree distribution
   deg_dist <- degree(g)
   metrics$degree_stats <- list(
@@ -263,58 +278,64 @@ validate_network <- function(gold_dir = "data/gold") {
     q75 = quantile(deg_dist, 0.75),
     max = max(deg_dist)
   )
-  
-  # Test clustering stability (10 runs)
+
+  # Stability test
   cat("Testing clustering stability (10 runs)...\n")
-  stability_results <- sapply(1:10, function(i) {
+  stability <- sapply(1:10, function(i) {
     set.seed(42 + i)
-    cl_test <- cluster_louvain(g, weights = E(g)$weight)
-    membership(cl_test)
+    membership(cluster_louvain(g, weights = E(g)$weight))
   })
-  
-  # Check if all runs produce identical results
-  identical_runs <- apply(stability_results, 1, function(x) length(unique(x)) == 1)
+
+  identical_runs <- apply(stability, 1, function(x) length(unique(x)) == 1)
   metrics$stability_pct <- mean(identical_runs) * 100
-  
+
   return(metrics)
 }
 
 # ==============================================================================
-# 5. GENERATE FIGURE 3: DEGREE DISTRIBUTION
+# 5. GENERATE FIGURE 3: DEGREE DISTRIBUTION (ROBUST)
 # ==============================================================================
 
 plot_degree_distribution <- function(gold_dir = "data/gold",
                                      out_dir = "outputs/figures") {
-  
+
   cat("Generating degree distribution plot...\n")
-  
   dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
-  
+
   edges_path <- file.path(gold_dir, "concept_cooccurrence_edges.parquet")
-  
+
   if (!file.exists(edges_path)) {
     cat("Warning: concept_cooccurrence_edges.parquet not found.\n")
     return(NULL)
   }
-  
+
   edges <- read_parquet(edges_path)
-  
   if (nrow(edges) == 0) {
     cat("Warning: No edges in network.\n")
     return(NULL)
   }
-  
-  # Build graph
+
+  # ---- Robust schema handling ----
+  if (all(c("source", "target") %in% names(edges))) {
+    from <- edges$source
+    to   <- edges$target
+  } else if (all(c("concept_name_a", "concept_name_b") %in% names(edges))) {
+    from <- edges$concept_name_a
+    to   <- edges$concept_name_b
+  } else {
+    stop(
+      "❌ Unrecognized edge schema.\n",
+      "Columns found: ", paste(names(edges), collapse = ", ")
+    )
+  }
+
+  weight <- if ("weight" %in% names(edges)) edges$weight else rep(1, length(from))
+
   g <- graph_from_data_frame(
-    d = data.frame(
-      from = edges$concept_name_a,
-      to = edges$concept_name_b,
-      weight = edges$weight
-    ),
+    d = data.frame(from = from, to = to, weight = weight),
     directed = FALSE
   )
-  
-  # Get degree distribution
+
   deg <- degree(g)
   deg_table <- table(deg)
   deg_df <- tibble(
@@ -322,30 +343,24 @@ plot_degree_distribution <- function(gold_dir = "data/gold",
     count = as.numeric(deg_table),
     cumulative = 1 - cumsum(count) / sum(count)
   )
-  
-  # Plot: log-log degree distribution
-  p1 <- ggplot(deg_df, aes(x = degree, y = count)) +
-    geom_point(size = 3, alpha = 0.6, color = "#2C5F8D") +
+
+  p <- ggplot(deg_df, aes(x = degree, y = count)) +
+    geom_point(size = 3, alpha = 0.6) +
     geom_line(alpha = 0.3) +
-    scale_x_log10(breaks = c(1, 2, 5, 10, 20, 50, 100)) +
-    scale_y_log10(breaks = c(1, 2, 5, 10, 20, 50, 100)) +
+    scale_x_log10() +
+    scale_y_log10() +
     labs(
       title = "Concept co-occurrence network: Degree distribution",
       subtitle = sprintf("N = %d concepts, %d edges", vcount(g), ecount(g)),
-      x = "Degree (number of connections)",
+      x = "Degree",
       y = "Number of concepts"
     ) +
-    theme_minimal(base_size = 12) +
-    theme(
-      plot.title = element_text(face = "bold", size = 14),
-      panel.grid.minor = element_blank()
-    )
-  
+    theme_minimal()
+
   out_path <- file.path(out_dir, "fig3_degree_distribution.png")
-  ggsave(out_path, p1, width = 8, height = 6, dpi = 300)
-  
+  ggsave(out_path, p, width = 8, height = 6, dpi = 300)
+
   cat(sprintf("Saved: %s\n", out_path))
-  
   return(out_path)
 }
 
@@ -480,7 +495,7 @@ run_all_validations <- function(silver_dir = "data/silver",
 # ==============================================================================
 
 # Run all validations
-# results <- run_all_validations()
+results <- run_all_validations()
 
 # Or run individual checks:
 # completeness <- calculate_completeness()
