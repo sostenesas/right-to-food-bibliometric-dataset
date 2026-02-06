@@ -1,0 +1,217 @@
+% Scientific Data manuscript template
+% Compile with pdflatex or xelatex
+
+\documentclass[11pt]{article}
+
+% Packages
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{hyperref}
+\usepackage{geometry}
+\usepackage{authblk}
+\usepackage{natbib}
+\usepackage{amsmath}
+\usepackage{makecell}
+\usepackage{xcolor}
+\usepackage{setspace}
+
+% Page layout
+\geometry{
+  letterpaper,
+  left=1in,
+  right=1in,
+  top=1in,
+  bottom=1in
+}
+
+% Hyperlinks
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  citecolor=blue,
+  urlcolor=blue
+}
+
+\doublespacing
+
+% Title
+\title{\textbf{Brazilian Academic Production on the Right to Food (2014--2023): A Reproducible Bibliometric Dataset}}
+
+% Author
+\author[1]{Sóstenes Azevedo}
+\affil[1]{INSPER / UFMA, Brazil}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\begin{center}
+\textit{Correspondence:} sostenesas@al.insper.edu.br / sostenes.soeiro@gmail.com
+\end{center}
+
+\vspace{1em}
+
+\begin{abstract}
+This paper describes a reproducible bibliometric dataset on Brazilian academic production concerning the right to food between 2014 and 2023. Records were retrieved from the OpenAlex API and processed through a three-layer pipeline (bronze, silver, and gold), producing normalized tabular data and analytical aggregations suitable for bibliometric and network analyses. The published dataset contains a curated thematic corpus of \textbf{991} documents, derived from an initial retrieval of \textbf{3,713} records prior to thematic filtering. The dataset includes metadata on authorship, institutional affiliations, citations, and OpenAlex concept assignments. All data and code are publicly available under open licenses, enabling transparent reuse for bibliometric studies, science policy analysis, and research evaluation.
+\end{abstract}
+
+\newpage
+
+\section{Background \& Summary}
+
+The right to food is recognized as a fundamental human right in international law and in the Brazilian constitutional framework. Over the last decade, Brazil has experienced major institutional and political transformations affecting food security policies, including the extinction of national governance structures (notably CONSEA in 2019) and the social impacts of the COVID-19 pandemic.
+
+In parallel, academic production on the topic has expanded across multiple disciplines, such as law, public health, social sciences, and nutrition. Despite this growth, no structured and openly available dataset existed to systematically map this scientific field in the Portuguese-language context.
+
+Previous bibliometric studies on food security have often focused on global English-language literature, which may overlook regional production in Portuguese and Spanish. This dataset addresses this gap by providing a curated and reproducible mapping of Brazilian scholarship on the right to food between 2014 and 2023.
+
+The dataset is organized in a three-layer architecture: (1) a bronze layer containing raw JSONL records retrieved from the OpenAlex API, (2) a silver layer with normalized Parquet tables (\texttt{works}, \texttt{authorships}, \texttt{concepts}, \texttt{references}), and (3) a gold layer with analytical aggregations and a concept co-occurrence network. The temporal coverage captures the decade following the constitutional amendment EC 64/2010 that explicitly recognized food as a social right in Brazil.
+
+\section{Methods}
+
+\subsection{Search Strategy}
+
+Data were retrieved from the OpenAlex platform (\url{https://openalex.org}), an open bibliographic database with extensive coverage and rich metadata. The search strategy combined geographic, linguistic, and temporal filters to target Brazilian Portuguese-language production related to the right to food and food (in)security.
+
+The OpenAlex API was queried using a free-text search component combined with structured filters restricting results to Brazilian institutional affiliations, Portuguese language, open access publications, and the period 2014--2023.
+
+\subsection{Data Collection}
+
+Data collection for version \textbf{v1.0.0} was performed on \textbf{2026-02-04} using the OpenAlex REST API endpoint \url{https://api.openalex.org/works}. Pagination was handled via cursor-based requests (\texttt{per-page=200}, \texttt{cursor=*}), with a short delay between calls to respect rate limits.
+
+All retrieved records were stored in newline-delimited JSON (JSONL) format. The pipeline was re-executed on \textbf{2026-02-05} to verify that the full workflow reproduces the expected outputs under the pinned software environment.
+
+\subsection{Data Processing Pipeline}
+
+The processing pipeline follows a three-layer architecture inspired by data lakehouse principles.
+
+\textbf{Bronze layer}: raw JSONL records obtained directly from the OpenAlex API.
+
+\textbf{Silver layer}: four normalized Parquet tables (\texttt{works}, \texttt{authorships}, \texttt{concepts}, \texttt{references}).
+
+\textbf{Gold layer}: analytical aggregations and a concept co-occurrence network, including \texttt{production\_by\_year}, \texttt{production\_by\_type}, \texttt{top\_sources}, \texttt{top\_concepts}, and \texttt{concept\_cooccurrence\_edges}.
+
+\subsection{Quality Control}
+
+The final thematic corpus (993 documents) was obtained through automated thematic filtering over titles and abstracts using accent-insensitive normalization. Additional manual checks confirmed thematic relevance and pipeline correctness.
+
+\subsection{How to reproduce the raw data retrieval using the OpenAlex web interface}
+
+For independent verification and transparency, the raw corpus underlying this dataset can be approximately reproduced using the OpenAlex web interface (\url{https://openalex.org/works}), without relying on programmatic access to the API.
+
+To reproduce the search, users should apply the following filters in the OpenAlex \textit{Works} explorer:
+
+\begin{enumerate}
+\item \textbf{Country}: Institutions $\rightarrow$ Country $\rightarrow$ Brazil.
+\item \textbf{Language}: Portuguese (pt).
+\item \textbf{Publication year}: from 2014 to 2023.
+\item \textbf{Open access}: Open access only.
+\end{enumerate}
+
+After applying these filters, the following keyword query should be entered in the search bar:
+
+\begin{quote}
+``direito à alimentação'', ``direito humano à alimentação'', ``direito à alimentação adequada'', ``segurança alimentar'', ``segurança alimentar e nutricional'', ``insegurança alimentar'', as well as their English equivalents ``right to food'', ``human right to food'', ``food security'', and ``food insecurity''.
+\end{quote}
+
+The resulting list of works corresponds to the unfiltered retrieval stage of the dataset (bronze layer) and can be manually exported using the \textit{Export $\rightarrow$ CSV} function available in the OpenAlex interface. While the exported CSV does not include all metadata fields available through the API (e.g., inverted abstract indexes), it enables independent inspection and verification of the corpus composition.
+
+\subsection{Differences between API-based and web-based retrieval}
+
+The OpenAlex web interface and the OpenAlex API rely on the same underlying database but differ in their retrieval mechanisms and export capabilities. API-based extraction enables cursor-based pagination, explicit snapshot documentation, structured filtering, and access to rich metadata fields such as authorship structures, concept hierarchies, and inverted abstract indexes.
+
+In contrast, the web interface applies internal relevance ranking and indexing strategies optimized for interactive exploration and supports export only in tabular (CSV) format. As OpenAlex is a continuously updated resource, the total number of records returned by the web interface may differ slightly from API-based retrievals executed at specific points in time.
+
+These discrepancies are expected and do not affect the validity of the published dataset, which is based on a documented API snapshot and a fully reproducible computational pipeline. The web-based procedure is therefore intended as an audit and transparency mechanism rather than as a substitute for programmatic data extraction.
+
+
+\section{Data Records}
+
+\subsection{Repository Location}
+
+The dataset is archived at Zenodo:
+
+\begin{quote}
+Azevedo, S. (2026). \textit{Brazilian Academic Production on the Right to Food (2014--2023): A Reproducible Bibliometric Dataset} (v1.0.0). Zenodo. \url{https://doi.org/10.5281/zenodo.18500452}
+\end{quote}
+
+\noindent License: CC-BY 4.0 \\
+Version: v1.0.0 \\
+Deposit date: 2026-02-04 \\
+Total size: 18 KB
+
+\subsection{File Structure}
+
+\begin{verbatim}
+data/
+├── bronze/
+│   └── openalex_bronze_YYYY-MM-DD_HHMMSS.jsonl
+├── silver/
+│   ├── works.parquet
+│   ├── authorships.parquet
+│   ├── concepts.parquet
+│   └── references.parquet
+└── gold/
+    ├── production_by_year.parquet
+    ├── production_by_type.parquet
+    ├── top_sources.parquet
+    ├── top_concepts.parquet
+    └── concept_cooccurrence_edges.parquet
+\end{verbatim}
+
+\section{Technical Validation}
+
+\subsection{Completeness}
+
+Core identifier fields are fully populated across all tables. Optional fields show expected variation and are documented in the validation outputs.
+
+\subsection{Consistency}
+
+Automated checks confirmed referential integrity across tables, valid publication years (2014--2023), language consistency (Portuguese), and uniqueness of work identifiers.
+
+\subsection{Network Validation}
+
+The concept co-occurrence network comprises \textbf{1,292 nodes} and \textbf{23,982 edges}, forming a single connected component. The average degree is 37.12, network density is 0.0288, diameter is 3, and average path length is 2.15.
+
+Community detection using the Louvain algorithm identified \textbf{6 clusters} with modularity \textbf{0.256}. Clustering stability across 10 runs was 29.0\%, reflecting expected variability for heuristic community detection methods. Such variability is expected given the heuristic and non-deterministic nature of modularity-based community detection algorithms and does not compromise the structural validity of the network.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.8\textwidth]{fig3_degree_distribution.png}
+\caption{Concept co-occurrence network degree distribution (log--log scale).}
+\end{figure}
+
+\section{Usage Notes}
+
+The dataset supports bibliometric analysis, science policy evaluation, and network-based studies. An interactive word cloud is provided in HTML format (\texttt{outputs/figures/wordcloud.html}).
+
+\section{Code Availability}
+
+The released dataset corresponds to the curated thematic corpus, while the full unfiltered retrieval is preserved in the bronze layer to ensure auditability and future reprocessing. All code is publicly available at:
+
+\url{https://github.com/sostenesas/right-to-food-bibliometric-dataset}
+
+\section*{Acknowledgements}
+
+The author thanks academic mentors and colleagues who provided feedback on the dataset design and processing pipeline.
+
+\section*{Author Contributions}
+
+S.A. conceived the study, designed the methodology, collected and processed the data, performed the analysis, and wrote the manuscript.
+
+\section*{Competing Interests}
+
+The author declares no competing interests.
+
+\section*{Data Availability}
+
+All data generated and analyzed during this study are available on Zenodo: \url{https://doi.org/10.5281/zenodo.18500452}.
+
+\bibliographystyle{naturemag}
+% \bibliography{references}
+
+\end{document}
