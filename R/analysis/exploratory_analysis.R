@@ -243,9 +243,9 @@ p_year_bar <- ggplot(df_year, aes(publication_year, n)) +
   geom_col() +
   theme_minimal() +
   labs(
-    title = "Produção por ano",
-    x = "Ano",
-    y = "Número de documentos"
+    title = "Production by year",
+    x = "year",
+    y = "number of documents"
   ) +
   theme(axis.text.x = element_text(angle = 45, hjust = 1))
 
@@ -256,9 +256,9 @@ p_year_line <- ggplot(df_year, aes(publication_year, n)) +
   geom_point(size = 2) +
   theme_minimal() +
   labs(
-    title = "Evolução temporal da produção",
-    x = "Ano",
-    y = "Número de documentos"
+    title = "Temporal evolution of production",
+    x = "year",
+    y = "number of documents"
   ) +
   theme(axis.text.x = element_text(angle = 45, hjust = 1))
 
@@ -275,9 +275,9 @@ p_cit <- ggplot(df_cit_year, aes(publication_year, total_citations)) +
   geom_col() +
   theme_minimal() +
   labs(
-    title = "Citações totais por ano",
-    x = "Ano",
-    y = "Total de citações"
+    title = "Total citation by year",
+    x = "year",
+    y = "total citations"
   ) +
   theme(axis.text.x = element_text(angle = 45, hjust = 1))
 
@@ -296,7 +296,7 @@ if ("type" %in% names(filtered)) {
     coord_flip() +
     theme_minimal() +
     labs(
-      title = "Top tipos de documentos",
+      title = "Top document types",
       x = NULL,
       y = "n"
     )

@@ -1,4 +1,4 @@
-# R/validation_metrics.R
+# R/validation/validation_metrics.R
 # Script para calcular todas as métricas de validação técnica
 # necessárias para o Data Paper
 
@@ -7,21 +7,42 @@ library(arrow)
 library(igraph)
 library(ggplot2)
 library(stringr)
+library(mclust)
+
+# ---- Reproducibility knobs (can be overridden before sourcing) ----
+if (!exists("SEED", inherits = FALSE)) SEED <- 123
+if (!exists("N_RUNS", inherits = FALSE)) N_RUNS <- 10
+set.seed(SEED)
 
 # ==============================================================================
 # 1. COMPLETENESS STATISTICS
 # ==============================================================================
 
 calculate_completeness <- function(silver_dir = "data/silver") {
-  
+
   cat("Calculating completeness statistics...\n")
-  
+
   # Load tables
   works <- read_parquet(file.path(silver_dir, "works.parquet"))
   authorships <- read_parquet(file.path(silver_dir, "authorships.parquet"))
   concepts <- read_parquet(file.path(silver_dir, "concepts.parquet"))
   references <- read_parquet(file.path(silver_dir, "references.parquet"))
-  
+
+  # Detect a "source" column robustly (schema differences across builds)
+  source_col <- dplyr::case_when(
+    "source" %in% names(works) ~ "source",
+    "source_name" %in% names(works) ~ "source_name",
+    "host_venue_display_name" %in% names(works) ~ "host_venue_display_name",
+    "host_venue" %in% names(works) ~ "host_venue",
+    TRUE ~ NA_character_
+  )
+
+  source_missing_pct <- if (!is.na(source_col)) {
+    mean(is.na(works[[source_col]])) * 100
+  } else {
+    NA_real_
+  }
+
   # Works completeness
   works_complete <- tibble(
     table = "works",
@@ -29,13 +50,13 @@ calculate_completeness <- function(silver_dir = "data/silver") {
     core_fields = "work_id, title, publication_year",
     pct_complete = "100%",
     missing_details = sprintf(
-      "doi: %.1f%%, publication_date: %.1f%%, source_name: %.1f%%",
+      "doi: %.1f%%, publication_date: %.1f%%, source: %s",
       mean(is.na(works$doi)) * 100,
       mean(is.na(works$publication_date)) * 100,
-      mean(is.na(works$source_name)) * 100
+      ifelse(is.na(source_missing_pct), "N/A", sprintf("%.1f%%", source_missing_pct))
     )
   )
-  
+
   # Authorships completeness
   authorships_complete <- tibble(
     table = "authorships",
@@ -47,7 +68,7 @@ calculate_completeness <- function(silver_dir = "data/silver") {
       mean(is.na(authorships$author_name)) * 100
     )
   )
-  
+
   # Concepts completeness
   concepts_complete <- tibble(
     table = "concepts",
@@ -56,7 +77,7 @@ calculate_completeness <- function(silver_dir = "data/silver") {
     pct_complete = "100%",
     missing_details = "None"
   )
-  
+
   # References completeness
   references_complete <- tibble(
     table = "references",
@@ -65,14 +86,14 @@ calculate_completeness <- function(silver_dir = "data/silver") {
     pct_complete = "100%",
     missing_details = "N/A"
   )
-  
+
   completeness_table <- bind_rows(
     works_complete,
     authorships_complete,
     concepts_complete,
     references_complete
   )
-  
+
   return(completeness_table)
 }
 
@@ -81,16 +102,16 @@ calculate_completeness <- function(silver_dir = "data/silver") {
 # ==============================================================================
 
 check_consistency <- function(silver_dir = "data/silver") {
-  
+
   cat("Running consistency checks...\n")
-  
+
   works <- read_parquet(file.path(silver_dir, "works.parquet"))
   authorships <- read_parquet(file.path(silver_dir, "authorships.parquet"))
   concepts <- read_parquet(file.path(silver_dir, "concepts.parquet"))
   references <- read_parquet(file.path(silver_dir, "references.parquet"))
-  
+
   results <- list()
-  
+
   # 1. Referential integrity: authorships
   auth_integrity <- all(authorships$work_id %in% works$work_id)
   results$authorships_integrity <- sprintf(
@@ -98,7 +119,7 @@ check_consistency <- function(silver_dir = "data/silver") {
     ifelse(auth_integrity, "TRUE", "FALSE"),
     mean(authorships$work_id %in% works$work_id) * 100
   )
-  
+
   # 2. Referential integrity: concepts
   conc_integrity <- all(concepts$work_id %in% works$work_id)
   results$concepts_integrity <- sprintf(
@@ -106,7 +127,7 @@ check_consistency <- function(silver_dir = "data/silver") {
     ifelse(conc_integrity, "TRUE", "FALSE"),
     mean(concepts$work_id %in% works$work_id) * 100
   )
-  
+
   # 3. Referential integrity: references
   refs_integrity <- all(references$work_id %in% works$work_id)
   results$references_integrity <- sprintf(
@@ -114,49 +135,53 @@ check_consistency <- function(silver_dir = "data/silver") {
     ifelse(refs_integrity, "TRUE", "FALSE"),
     mean(references$work_id %in% works$work_id) * 100
   )
-  
+
   # 4. Publication year range
   year_range <- range(works$publication_year, na.rm = TRUE)
   results$year_range <- sprintf(
     "Publication years: %d-%d (expected: 2014-2023)",
     year_range[1], year_range[2]
   )
-  
+
   # 5. Year validity
   valid_years <- works$publication_year >= 2014 & works$publication_year <= 2023
   results$year_validity <- sprintf(
     "Valid years (2014-2023): %.1f%%",
     mean(valid_years, na.rm = TRUE) * 100
   )
-  
+
   # 6. Language consistency
   lang_consistency <- mean(works$language == "pt", na.rm = TRUE)
   results$language_consistency <- sprintf(
     "Documents in Portuguese: %.1f%%",
     lang_consistency * 100
   )
-  
+
   # 7. Work ID uniqueness
   duplicate_ids <- sum(duplicated(works$work_id))
   results$work_id_uniqueness <- sprintf(
     "Duplicate work_ids: %d (should be 0)",
     duplicate_ids
   )
-  
-  # 8. Temporal distribution
-  year_dist <- works %>%
-    count(publication_year) %>%
-    arrange(publication_year)
-  
+
+  # 8. Temporal distribution (ROBUST: avoid arrange() on any list-typed columns)
+  py <- works$publication_year
+  py <- py[!is.na(py)]
+  tab <- sort(table(py))  # sorted by year
+
+  years_present <- length(tab)
+  min_n <- min(tab)
+  max_n <- max(tab)
+  min_year <- as.integer(names(tab)[which.min(tab)])
+  max_year <- as.integer(names(tab)[which.max(tab)])
+
   results$temporal_distribution <- sprintf(
     "Years with publications: %d/10, Min: %d (year %d), Max: %d (year %d)",
-    nrow(year_dist),
-    min(year_dist$n),
-    year_dist$publication_year[which.min(year_dist$n)],
-    max(year_dist$n),
-    year_dist$publication_year[which.max(year_dist$n)]
+    years_present,
+    as.integer(min_n), min_year,
+    as.integer(max_n), max_year
   )
-  
+
   return(results)
 }
 
@@ -165,17 +190,17 @@ check_consistency <- function(silver_dir = "data/silver") {
 # ==============================================================================
 
 document_schema <- function(silver_dir = "data/silver") {
-  
+
   cat("Documenting table schemas...\n")
-  
+
   works <- read_parquet(file.path(silver_dir, "works.parquet"))
   authorships <- read_parquet(file.path(silver_dir, "authorships.parquet"))
   concepts <- read_parquet(file.path(silver_dir, "concepts.parquet"))
   references <- read_parquet(file.path(silver_dir, "references.parquet"))
-  
+
   # Helper function to create schema table
   create_schema_table <- function(df, table_name) {
-    
+
     schema <- tibble(
       column = names(df),
       type = vapply(df, function(x) class(x)[1], character(1)),
@@ -188,20 +213,20 @@ document_schema <- function(silver_dir = "data/silver") {
         sprintf("%.1f%%", (1 - mean(is.na(x))) * 100)
       }, character(1))
     )
-    
+
     schema$table <- table_name
     schema <- schema %>% select(table, column, type, example, pct_complete)
-    
+
     return(schema)
   }
-  
+
   schemas <- list(
     works = create_schema_table(works, "works"),
     authorships = create_schema_table(authorships, "authorships"),
     concepts = create_schema_table(concepts, "concepts"),
     references = create_schema_table(references, "references")
   )
-  
+
   return(schemas)
 }
 
@@ -264,7 +289,7 @@ validate_network <- function(gold_dir = "data/gold") {
   )
 
   # Clustering
-  set.seed(42)
+  set.seed(SEED)
   cl <- cluster_louvain(g, weights = E(g)$weight)
   metrics$n_clusters <- length(cl)
   metrics$modularity <- modularity(cl)
@@ -279,15 +304,27 @@ validate_network <- function(gold_dir = "data/gold") {
     max = max(deg_dist)
   )
 
-  # Stability test
-  cat("Testing clustering stability (10 runs)...\n")
-  stability <- sapply(1:10, function(i) {
-    set.seed(42 + i)
-    membership(cluster_louvain(g, weights = E(g)$weight))
-  })
+  # ---- Stability test: mean pairwise ARI across runs ----
+  cat("Testing clustering stability (", N_RUNS, " runs)...\n", sep = "")
 
-  identical_runs <- apply(stability, 1, function(x) length(unique(x)) == 1)
-  metrics$stability_pct <- mean(identical_runs) * 100
+  clusterings <- vector("list", N_RUNS)
+  for (i in seq_len(N_RUNS)) {
+    set.seed(SEED + i)
+    cl_i <- cluster_louvain(g, weights = E(g)$weight)
+    clusterings[[i]] <- as.integer(membership(cl_i))
+  }
+
+  ari_values <- numeric(0)
+  for (i in 1:(N_RUNS - 1)) {
+    for (j in (i + 1):N_RUNS) {
+      ari_values <- c(
+        ari_values,
+        mclust::adjustedRandIndex(clusterings[[i]], clusterings[[j]])
+      )
+    }
+  }
+
+  metrics$stability_pct <- mean(ari_values) * 100
 
   return(metrics)
 }
@@ -370,13 +407,13 @@ plot_degree_distribution <- function(gold_dir = "data/gold",
 
 plot_completeness_heatmap <- function(silver_dir = "data/silver",
                                       out_dir = "outputs/figures") {
-  
+
   cat("Generating completeness heatmap...\n")
-  
+
   dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
-  
+
   works <- read_parquet(file.path(silver_dir, "works.parquet"))
-  
+
   # Calculate completeness for each column
   completeness <- tibble(
     field = names(works),
@@ -391,9 +428,9 @@ plot_completeness_heatmap <- function(silver_dir = "data/silver",
       )
     ) %>%
     arrange(desc(pct_complete))
-  
+
   p2 <- ggplot(completeness, aes(x = reorder(field, pct_complete), y = 1, fill = pct_complete)) +
-    geom_tile(color = "white", size = 0.5) +
+    geom_tile(color = "white", linewidth = 0.5) +  # size -> linewidth
     geom_text(aes(label = sprintf("%.0f%%", pct_complete)), size = 3) +
     scale_fill_gradient2(
       low = "#D73027", mid = "#FEE08B", high = "#1A9850",
@@ -415,12 +452,12 @@ plot_completeness_heatmap <- function(silver_dir = "data/silver",
       panel.grid = element_blank(),
       legend.position = "right"
     )
-  
+
   out_path <- file.path(out_dir, "fig4_completeness_heatmap.png")
   ggsave(out_path, p2, width = 7, height = 8, dpi = 300)
-  
+
   cat(sprintf("Saved: %s\n", out_path))
-  
+
   return(out_path)
 }
 
@@ -431,17 +468,17 @@ plot_completeness_heatmap <- function(silver_dir = "data/silver",
 run_all_validations <- function(silver_dir = "data/silver",
                                 gold_dir = "data/gold",
                                 out_dir = "outputs/validation") {
-  
+
   dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
-  
+
   cat("\n=== RUNNING ALL VALIDATION CHECKS ===\n\n")
-  
+
   # 1. Completeness
   cat("\n--- 1. COMPLETENESS STATISTICS ---\n")
   completeness <- calculate_completeness(silver_dir)
   print(completeness)
   write.csv(completeness, file.path(out_dir, "table2_completeness.csv"), row.names = FALSE)
-  
+
   # 2. Consistency
   cat("\n--- 2. CONSISTENCY CHECKS ---\n")
   consistency <- check_consistency(silver_dir)
@@ -449,7 +486,7 @@ run_all_validations <- function(silver_dir = "data/silver",
     cat(sprintf("%s: %s\n", name, consistency[[name]]))
   }
   writeLines(unlist(consistency), file.path(out_dir, "consistency_results.txt"))
-  
+
   # 3. Schema documentation
   cat("\n--- 3. SCHEMA DOCUMENTATION ---\n")
   schemas <- document_schema(silver_dir)
@@ -457,12 +494,12 @@ run_all_validations <- function(silver_dir = "data/silver",
     cat(sprintf("\nTable: %s\n", table_name))
     print(head(schemas[[table_name]], 10))
     write.csv(
-      schemas[[table_name]], 
+      schemas[[table_name]],
       file.path(out_dir, sprintf("table_schema_%s.csv", table_name)),
       row.names = FALSE
     )
   }
-  
+
   # 4. Network validation
   cat("\n--- 4. NETWORK VALIDATION ---\n")
   network_metrics <- validate_network(gold_dir)
@@ -470,16 +507,16 @@ run_all_validations <- function(silver_dir = "data/silver",
     print(network_metrics)
     saveRDS(network_metrics, file.path(out_dir, "network_metrics.rds"))
   }
-  
+
   # 5. Generate figures
   cat("\n--- 5. GENERATING FIGURES ---\n")
   fig3 <- plot_degree_distribution(gold_dir, "outputs/figures")
   fig4 <- plot_completeness_heatmap(silver_dir, "outputs/figures")
-  
+
   cat("\n=== VALIDATION COMPLETE ===\n")
   cat(sprintf("Results saved to: %s\n", out_dir))
   cat(sprintf("Figures saved to: outputs/figures/\n"))
-  
+
   # Return summary
   return(list(
     completeness = completeness,
@@ -494,8 +531,10 @@ run_all_validations <- function(silver_dir = "data/silver",
 # 8. USAGE EXAMPLE
 # ==============================================================================
 
-# Run all validations
-results <- run_all_validations()
+# Run all validations (only auto-run in interactive sessions)
+if (interactive()) {
+  results <- run_all_validations()
+}
 
 # Or run individual checks:
 # completeness <- calculate_completeness()
