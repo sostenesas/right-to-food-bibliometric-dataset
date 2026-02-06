@@ -1,0 +1,8 @@
+All work_id in authorships exist in works: TRUE (100.0%)
+All work_id in concepts exist in works: TRUE (100.0%)
+All work_id in references exist in works: TRUE (100.0%)
+Publication years: 2014-2023 (expected: 2014-2023)
+Valid years (2014-2023): 100.0%
+Documents in Portuguese: 100.0%
+Duplicate work_ids: 0 (should be 0)
+Years with publications: 10/10, Min: 177 (year 2014), Max: 669 (year 2023)

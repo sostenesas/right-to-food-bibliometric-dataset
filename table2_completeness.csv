@@ -1,0 +1,5 @@
+"table","total_rows","core_fields","pct_complete","missing_details"
+"works",3713,"work_id, title, publication_year","100%","doi: 8.3%, publication_date: 0.0%, source_name: NaN%"
+"authorships",15680,"work_id, author_id","100%","author_name: 0.0%, institution details: varies"
+"concepts",20486,"work_id, concept_id, concept_score","100%","None"
+"references",53808,"work_id, referenced_work_id","100%","N/A"
