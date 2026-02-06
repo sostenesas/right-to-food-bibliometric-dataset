@@ -2,20 +2,19 @@
 Reproducible bibliometric dataset and pipeline based on OpenAlex.
 
 ## Dataset (Zenodo)
-DOI: 10.5281/zenodo.18462393
+DOI: 10.5281/zenodo.18500452
 
 ## Repository structure
 - `R/scripts/` — data collection and processing scripts
 - `R/validation/` — validation metrics and automated checks
 - `outputs/figures/` — figures used in the manuscript
 - `outputs/validation/` — validation tables and logs
-- `paper/` — manuscript (LaTeX/PDF)
+- `paper/` — manuscript (LaTeX)
 - `docs/` — user guides
 
 ## Quick start (R)
 ```r
-source("R/scripts/00_setup.R")
-targets::tar_make()
+source("R/scripts/99_run_pipeline.R")
 
 ## License
 
